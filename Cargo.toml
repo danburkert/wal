@@ -1,0 +1,4 @@
+[package]
+name = "wal"
+version = "0.1.0"
+authors = ["Dan Burkert <dan@danburkert.com>"]
