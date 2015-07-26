@@ -1,3 +1,5 @@
-#[test]
-fn it_works() {
-}
+extern crate byteorder;
+extern crate crc;
+extern crate rand;
+
+pub mod segment;
