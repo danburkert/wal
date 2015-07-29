@@ -9,4 +9,9 @@ crc = "*"
 rand = "*"
 
 [dev-dependencies]
+docopt = "*"
+histogram = { git = "https://github.com/brayniac/histogram" }
+regex = "*"
+rustc-serialize = "*"
 tempdir = "*"
+time = "*"
