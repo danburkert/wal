@@ -4,12 +4,12 @@ A work-in-progress write ahead logging library for Rust.
 
 ## Roadmap
 
-[*] file based segment
-[*] benchmarks
-[ ] mmap based segment
-[ ] higher level wal abstraction
-[ ] asynchronous appends
-[ ] compression
+- [x] file based segment
+- [x] benchmarks
+- [ ] mmap based segment
+- [ ] higher level wal type
+- [ ] asynchronous appends
+- [ ] compression
 
 ## Running Benchmarks
 
