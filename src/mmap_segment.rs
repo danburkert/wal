@@ -1,36 +1,43 @@
-use std::cmp;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{
-    BufRead,
-    BufReader,
     Error,
     ErrorKind,
-    Read,
     Result,
-    Seek,
-    SeekFrom,
-    Take,
     Write,
 };
 use std::path::Path;
-use std::usize;
+use std::sync::Arc;
+use std::cell::UnsafeCell;
+use std::slice;
+use std::ops;
 
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
+use memmap::{Mmap, Protection};
 use rand;
 
 const SEGMENT_HEADER: &'static [u8; 4] = b"wal\0";
-const SEGMENT_HEADER_LEN: u64 = 8;
-const ENTRY_HEADER_LEN: u64 = 12;
-const CRC32_LEN: u64 = 4;
+const SEGMENT_HEADER_LEN: usize = 8;
+const ENTRY_HEADER_LEN: usize = 12;
+const CRC32_LEN: usize = 4;
 
-#[derive(Debug)]
-struct Entry {
+pub struct Entry {
+    map: Arc<UnsafeCell<Mmap>>,
     /// The offset of the entry's data in the segment file.
-    offset: u64,
-
+    offset: usize,
     /// The length of the entry's data in the segment file.
     len: usize,
+}
+
+impl ops::Deref for Entry {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        unsafe {
+            let ptr = (&*self.map.get()).ptr();
+            slice::from_raw_parts(ptr.offset(self.offset as isize), self.len)
+        }
+    }
 }
 
 /// A single-file, append-only, durable log.
@@ -40,14 +47,11 @@ struct Entry {
 /// available space, and the limits of `usize`. The number of entries is bounded
 /// by the limits of `usize`.
 pub struct Segment {
-    /// The file containing the entries.
-    file: File,
+    /// The memory-mapped segment file.
+    map: Arc<UnsafeCell<Mmap>>,
 
-    /// The segment capacity.
-    cap: u64,
-
-    /// An index holding the offset and length of each entry.
-    index: Vec<Entry>,
+    /// An index holding the offset and length of each entry in the segment.
+    index: Vec<(usize, usize)>,
 
     /// The last crc value written.
     crc: u32,
@@ -56,14 +60,9 @@ pub struct Segment {
 impl Segment {
 
     /// Opens the log segment at the specified path.
-    pub fn open<P>(file: P) -> Result<Segment> where P: AsRef<Path> {
-        let file = try!(OpenOptions::new()
-                                    .read(true)
-                                    .write(true)
-                                    .create(false)
-                                    .open(file));
-        let cap = try!(file.metadata()).len();
-        let mut segment = Segment { file: file, cap: cap, index: Vec::new(), crc: 0};
+    pub fn open<P>(path: P) -> Result<Segment> where P: AsRef<Path> {
+        let map = try!(Mmap::open_path(&path, Protection::ReadWrite));
+        let mut segment = Segment { map: Arc::new(UnsafeCell::new(map)), index: Vec::new(), crc: 0};
         try!(segment.reindex());
         Ok(segment)
     }
@@ -89,31 +88,33 @@ impl Segment {
     /// CRC seed is serialized in little-endian format. The CRC seed ensures
     /// that if a segment file is overwritten with a new segment, the old
     /// segments entries will be ignored (since the CRC will not match).
-    pub fn create<P>(file: P, capacity: usize) -> Result<Segment> where P: AsRef<Path> {
-        if capacity < SEGMENT_HEADER_LEN as usize {
+    pub fn create<P>(path: P, capacity: usize) -> Result<Segment> where P: AsRef<Path> {
+        if capacity < SEGMENT_HEADER_LEN {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid segment capacity"));
         }
 
-        let mut file = try!(OpenOptions::new()
-                                        .read(true)
-                                        .write(true)
-                                        .create(true)
-                                        .open(file));
+        let file = try!(OpenOptions::new()
+                                    .read(true)
+                                    .write(true)
+                                    .create(true)
+                                    .open(path));
 
-        let mut header = [0; 8];
-        try!((&mut header[..4]).write_all(SEGMENT_HEADER));
-        let seed = rand::random();
-        LittleEndian::write_u32(&mut header[4..], seed);
-
+        // Set the file's length and sync the metadata changes to disk.
         // TODO: this should be using posix_fallocate to avoid creating a sparse file.
         try!(file.set_len(capacity as u64));
-        try!(file.write_all(&header));
-        try!(file.sync_all());
-        Ok(Segment { file: file, cap: capacity as u64, index: Vec::new(), crc: seed })
-    }
 
-    pub fn sync(&mut self) ->Result<()> {
-        self.file.sync_data()
+        let mut map = try!(Mmap::open_with_offset(&file, Protection::ReadWrite, 0, capacity));
+
+        let seed = rand::random();
+
+        // Write and sync the header information.
+        unsafe {
+            try!((&mut map.as_mut_slice()[0..4]).write_all(SEGMENT_HEADER));
+            LittleEndian::write_u32(&mut map.as_mut_slice()[4..], seed);
+        }
+
+        try!(file.sync_all());
+        Ok(Segment { map: Arc::new(UnsafeCell::new(map)), index: Vec::new(), crc: seed })
     }
 
     /// Appends an entry to the segment. Returns the entry index, or `None` if
@@ -138,60 +139,72 @@ impl Segment {
     /// `u64` and `u32` values are serialized in little endian form.
     /// [CRC32-C](https://en.wikipedia.org/wiki/Cyclic_redundancy_check) is
     /// used.
-    pub fn append(&mut self, entry: &[u8]) -> Result<Option<usize>> {
-        if entry.len() as u64 > self.remaining() {
+    pub fn append<T>(&mut self, entry: &T) -> Result<Option<usize>>
+    where T: ops::Deref<Target=[u8]> {
+        if entry.len() > self.remaining() {
             return Ok(None);
         }
 
-        let zeros: [u8; 4] = [0; 4];
-        let mut buf = [0; 12];
+        let padding = padding(entry.len());
+        let padded_len = entry.len() + padding;
+        let total_len = ENTRY_HEADER_LEN + padded_len + CRC32_LEN;
 
-        let entry_offset = self.len();
-        try!(self.file.seek(SeekFrom::Start(entry_offset)));
+        let offset = self.len();
 
-        LittleEndian::write_u64(&mut buf[..8], entry.len() as u64);
+        let buf = unsafe {
+            slice::from_raw_parts_mut(self.map_mut().mut_ptr().offset(offset as isize), total_len)
+        };
+
+        LittleEndian::write_u64(buf, entry.len() as u64);
         let mut crc = crc32::update(self.crc, &crc32::CASTAGNOLI_TABLE, &buf[..8]);
         LittleEndian::write_u32(&mut buf[8..], crc);
 
-        try!(self.file.write_all(&buf));
-        try!(self.file.write_all(entry));
-        crc = crc32::update(crc, &crc32::CASTAGNOLI_TABLE, &entry);
+        try!((&mut buf[ENTRY_HEADER_LEN..]).write_all(&*entry));
 
-        let padding = padding(entry.len());
         if padding > 0 {
-            crc = crc32::update(crc, &crc32::CASTAGNOLI_TABLE, &zeros[0..padding]);
-            try!((&mut buf[0..padding]).write_all(&zeros[0..padding]));
+            let zeros: [u8; 4] = [0; 4];
+            try!((&mut buf[ENTRY_HEADER_LEN + entry.len()..]).write_all(&zeros[..padding]));
         }
-        LittleEndian::write_u32(&mut buf[padding..padding + 4], crc);
-        try!(self.file.write_all(&buf[..padding + 4]));
-        self.index.push(Entry { offset: entry_offset + ENTRY_HEADER_LEN,
-                                len: entry.len() });
+        crc = crc32::update(crc,
+                            &crc32::CASTAGNOLI_TABLE,
+                            &buf[ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + padded_len]);
+        LittleEndian::write_u32(&mut buf[ENTRY_HEADER_LEN + padded_len..], crc);
+        self.index.push((offset + ENTRY_HEADER_LEN, entry.len()));
         self.crc = crc;
 
         Ok(Some(self.index.len() - 1))
     }
 
-    /// Reads the entry at the index from the segment, or `None` if no such
+    /// Returns the entry Reads the entry at the index from the segment, or `None` if no such
     /// segment exists.
-    pub fn read(&mut self, index: usize) -> Result<Take<&mut File>> {
-        let Entry { offset, len } = self.index[index];
-        try!(self.file.seek(SeekFrom::Start(offset)));
-        Ok(Read::by_ref(&mut self.file).take(len as u64))
+    ///
+    pub fn read(&mut self, index: usize) -> Option<Entry> {
+        self.index
+            .get(index)
+            .map(|&(offset, len)| {
+                Entry { map: self.map.clone(),
+                        offset: offset,
+                        len: len }
+            })
+    }
+
+    pub fn sync(&mut self) ->Result<()> {
+        self.map_mut().flush()
     }
 
     /// Returns the capacity of the segment in bytes.
     ///
     /// Each entry is stored with a header and padding, so the entire capacity
     /// will not be available for entry data.
-    pub fn capacity(&self) -> u64 {
-        self.cap
+    pub fn capacity(&self) -> usize {
+        self.map().len()
     }
 
     /// Number of bytes written to the file.
-    pub fn len(&self) -> u64 {
+    pub fn len(&self) -> usize {
         self.index
             .last()
-            .map(|entry| entry.offset + entry.len as u64 + padding(entry.len) as u64 + CRC32_LEN )
+            .map(|&(offset, len)| offset + len + padding(len) + CRC32_LEN )
             .unwrap_or(SEGMENT_HEADER_LEN)
     }
 
@@ -204,11 +217,10 @@ impl Segment {
     ///
     /// This method can be used to make sure that an entry can be appended to
     /// the segment without allocating additional file space.
-    pub fn remaining(&self) -> u64 {
-        let unpadded = self.cap - self.len() - SEGMENT_HEADER_LEN - CRC32_LEN;
-        // Round down to a multiple of four, since padding would otherwise be
-        // required.
-        unpadded & 0xFFFFFFFFFFFFFFFCu64
+    pub fn remaining(&self) -> usize {
+        let unpadded = self.capacity() - self.len() - SEGMENT_HEADER_LEN - CRC32_LEN;
+        // Round down to a multiple of four, since padding would otherwise be required.
+        unpadded & !3
     }
 
     /// Reindex the segment.
@@ -217,11 +229,8 @@ impl Segment {
     pub fn reindex(&mut self) -> Result<()> {
         self.index.clear();
 
-        try!(self.file.seek(SeekFrom::Start(0)));
-        let mut file = BufReader::with_capacity(4096, Read::by_ref(&mut self.file));
-        let mut buf = [0; 12];
+        let mut buf = unsafe { (&*self.map.get()).as_slice() };
 
-        try!(read_exact(&mut file, &mut buf[..8]));
         if &buf[..4] != SEGMENT_HEADER {
             return Err(Error::new(ErrorKind::InvalidData, "invalid segment header"));
         }
@@ -229,64 +238,43 @@ impl Segment {
 
         let mut offset = SEGMENT_HEADER_LEN;
 
-        while offset + ENTRY_HEADER_LEN + CRC32_LEN < self.cap {
-            try!(read_exact(&mut file, &mut buf));
+        buf = &buf[SEGMENT_HEADER_LEN..];
 
-            let len = LittleEndian::read_u64(&buf[..8]);
-            if len > usize::MAX as u64 { break; }
-            let padding = padding(len as usize) as u64;
+        while buf.len() >= ENTRY_HEADER_LEN + CRC32_LEN {
+            let len = LittleEndian::read_u64(buf) as usize;
+            let padding = padding(len);
             let padded_len = len + padding;
 
             let mut crc = crc32::update(self.crc, &crc32::CASTAGNOLI_TABLE, &buf[..8]);
             if crc != LittleEndian::read_u32(&buf[8..]) { break; }
-            if offset + ENTRY_HEADER_LEN + padded_len + CRC32_LEN > self.cap { break; }
+            if ENTRY_HEADER_LEN + padded_len + CRC32_LEN > self.capacity() { break; }
 
-            let mut pos = 0;
-            while pos < padded_len {
-                let amt;
-                {
-                    let buf = try!(file.fill_buf());
-                    amt = cmp::min(buf.len(), (padded_len - pos) as usize);
-                    crc = crc32::update(crc, &crc32::CASTAGNOLI_TABLE, &buf[..amt]);
-                }
-                file.consume(amt);
-                pos += amt as u64;
-            }
+            crc = crc32::update(crc,
+                                &crc32::CASTAGNOLI_TABLE,
+                                &buf[ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + padded_len]);
+            if crc != LittleEndian::read_u32(&buf[ENTRY_HEADER_LEN + padded_len..]) { break; }
 
-            if crc != try!(file.read_u32::<LittleEndian>()) { break; }
-
-            self.index.push(Entry { offset: offset + ENTRY_HEADER_LEN, len: len as usize });
+            self.index.push((offset + ENTRY_HEADER_LEN, len));
             self.crc = crc;
+            buf = &buf[ENTRY_HEADER_LEN + padded_len + CRC32_LEN..];
             offset += ENTRY_HEADER_LEN + padded_len + CRC32_LEN;
         }
         Ok(())
     }
+
+    fn map(&self) -> &Mmap {
+        unsafe { &*self.map.get() }
+    }
+
+    fn map_mut(&mut self) -> &mut Mmap {
+        unsafe { &mut *self.map.get() }
+    }
+
 }
 
 /// Returns the number of padding bytes to add to a buffer to ensure 4-byte alignment.
 fn padding(len: usize) -> usize {
     0usize.wrapping_sub(len) & 3
-}
-
-/// Reads into `buf` until it is full. Returns an error if EOF is encountered first.
-pub fn read_exact<R>(read: &mut R, buf: &mut [u8]) -> Result<()>
-where R: Read {
-    let mut pos = 0;
-    let len = buf.len();
-    while pos < len {
-        let buf1 = &mut buf[pos..];
-        match read.read(buf1) {
-            Ok(n) => {
-                pos += n;
-                if n == 0 {
-                    return Err(Error::new(ErrorKind::Other, "Premature EOF"))
-                }
-            },
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => (), // retry 
-            Err(err) => return Err(err), // retry
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -356,11 +344,8 @@ mod test {
             assert_eq!(index, segment.append(entry).unwrap().unwrap());
         }
 
-        let mut buf = Vec::new();
         for index in 0..entries.len() {
-            buf.clear();
-            segment.read(index).unwrap().read_to_end(&mut buf).unwrap();
-            assert_eq!(entries[index], &buf[..]);
+            assert_eq!(entries[index], &*segment.read(index).unwrap());
         }
     }
 
@@ -393,11 +378,8 @@ mod test {
         assert_eq!(4096, segment.capacity());
         assert_eq!(entries.len(), segment.count());
 
-        let mut buf = Vec::new();
         for index in 0..entries.len() {
-            buf.clear();
-            segment.read(index).unwrap().read_to_end(&mut buf).unwrap();
-            assert_eq!(entries[index], &buf[..]);
+            assert_eq!(entries[index], &*segment.read(index).unwrap());
         }
     }
 

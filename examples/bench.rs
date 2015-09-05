@@ -14,7 +14,7 @@ use histogram::{Histogram, HistogramConfig};
 use rand::Rng;
 use regex::Regex;
 
-use wal::segment::Segment;
+use wal::mmap_segment::Segment;
 
 static USAGE: &'static str = "
 Usage:
@@ -45,7 +45,6 @@ fn main() {
     if args.cmd_append {
         append(&args);
     }
-
 }
 
 fn format_duration(n: u64) -> String {
@@ -60,7 +59,7 @@ fn format_duration(n: u64) -> String {
     }
 }
 
-fn format_bytes(n: u64) -> String {
+fn format_bytes(n: usize) -> String {
     if n > 1_073_741_824 {
         format!("{:.2}GiB", n as f64 / 1_073_741_824f64)
     } else if n > 1_048_576 {
@@ -72,10 +71,10 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
-fn parse_bytes(s: &str) -> u64 {
+fn parse_bytes(s: &str) -> usize {
     let regex = Regex::new(r"(?i)^(\d+(?:\.\d+)?)\s?(k|m|g)?i?b?$").unwrap();
     let caps = regex.captures(s).expect(&format!("unable to parse byte amount: {}", s));
-    let n: u64 = FromStr::from_str(caps.at(1).unwrap()).unwrap();
+    let n: usize = FromStr::from_str(caps.at(1).unwrap()).unwrap();
 
     match caps.at(2) {
         None => n,
@@ -145,10 +144,10 @@ fn append(args: &Args) {
     }
 
     let time = end_time - start_time;
-    let data = entries as u64 * entry_size;
-    let rate = (data as f64 / (time as f64 / 1_000_000_000f64)) as u64;
-    let overhead_amount = segment.len() - data;
-    let overhead_rate = (overhead_amount as f64 / (time as f64 / 1_000_000_000f64)) as u64;
+    let data = entries * entry_size;
+    let rate = (data as f64 / (time as f64 / 1_000_000_000f64)) as usize;
+    let overhead_amount = segment.len() as usize - data;
+    let overhead_rate = (overhead_amount as f64 / (time as f64 / 1_000_000_000f64)) as usize;
 
     println!("time: {}, data: {} ({}), rate {}/s ({}/s), entries appended: {}",
              format_duration(time),
