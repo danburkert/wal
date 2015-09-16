@@ -13,7 +13,8 @@ log = "*"
 
 [dev-dependencies]
 docopt = "*"
-histogram = { git = "https://github.com/brayniac/histogram" }
+env_logger = "*"
+histogram = "*"
 regex = "*"
 rustc-serialize = "*"
 tempdir = "*"

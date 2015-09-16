@@ -6,14 +6,16 @@ use std::io::{
     Write,
 };
 use std::ops;
+use std::ptr;
 use std::path::Path;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
+use eventual::Future;
 use memmap::{Mmap, Protection};
 use rand;
 
-use mmap::Map;
+use mmap::{Map, Flusher};
 
 const SEGMENT_HEADER: &'static [u8; 4] = b"wal\0";
 const SEGMENT_HEADER_LEN: usize = 8;
@@ -35,14 +37,17 @@ pub struct Segment {
 
     /// The last crc value written.
     crc: u32,
+
+    flusher: Flusher,
 }
 
 impl Segment {
 
     /// Opens the log segment at the specified path.
     pub fn open<P>(path: P) -> Result<Segment> where P: AsRef<Path> {
-        let map = try!(Mmap::open_path(&path, Protection::ReadWrite));
-        let mut segment = Segment { map: Map::new(map), index: Vec::new(), crc: 0};
+        let map = Map::new(try!(Mmap::open_path(&path, Protection::ReadWrite)));
+        let flusher = Flusher::with_offset(map.clone(), 0);
+        let mut segment = Segment { map: map, index: Vec::new(), crc: 0, flusher: flusher};
         try!(segment.reindex());
         Ok(segment)
     }
@@ -95,11 +100,16 @@ impl Segment {
         }
 
         try!(file.sync_all());
-        Ok(Segment { map: Map::new(map), index: Vec::new(), crc: seed })
+        let map = Map::new(map);
+        let flusher = Flusher::with_offset(map.clone(), SEGMENT_HEADER_LEN);
+        Ok(Segment { map: map, index: Vec::new(), crc: seed, flusher: flusher })
     }
 
-    /// Appends an entry to the segment. Returns the entry index, or `None` if
-    /// the entry does not fit in the segment.
+    /// Appends an entry to the segment, returning `None` if there is insufficient space in the log
+    /// for the entry, or the index of the entry and a completion future.
+    ///
+    /// The entry may be immediately read from the log, but it is not guaranteed to be durably
+    /// stored on disk until the future is complete (and is not an error).
     ///
     /// # Entry Format
     ///
@@ -120,10 +130,10 @@ impl Segment {
     /// `u64` and `u32` values are serialized in little endian form.
     /// [CRC32-C](https://en.wikipedia.org/wiki/Cyclic_redundancy_check) is
     /// used.
-    pub fn append<T>(&mut self, entry: &T) -> Result<Option<usize>>
+    pub fn append<T>(&mut self, entry: &T) -> Option<(usize, Future<(), Error>)>
     where T: ops::Deref<Target=[u8]> {
         if entry.len() > self.remaining() {
-            return Ok(None);
+            return None;
         }
 
         let padding = padding(entry.len());
@@ -140,11 +150,21 @@ impl Segment {
             crc = crc32::update(crc, &crc32::CASTAGNOLI_TABLE, &buf[..8]);
             LittleEndian::write_u32(&mut buf[8..], crc);
 
-            try!((&mut buf[ENTRY_HEADER_LEN..]).write_all(&*entry));
+            // ptr::copy_nonoverlapping is used here since `write_all` returns a Result, and that
+            // is hard to deal with, and bytes::copy_memory is unstable.
+            unsafe {
+                ptr::copy_nonoverlapping(entry.as_ptr(),
+                                         buf[ENTRY_HEADER_LEN..].as_mut_ptr(),
+                                         entry.len());
+            }
 
             if padding > 0 {
                 let zeros: [u8; 4] = [0; 4];
-                try!((&mut buf[ENTRY_HEADER_LEN + entry.len()..]).write_all(&zeros[..padding]));
+                unsafe {
+                    ptr::copy_nonoverlapping(zeros.as_ptr(),
+                                             buf[ENTRY_HEADER_LEN + entry.len()..].as_mut_ptr(),
+                                             padding);
+                }
             }
             crc = crc32::update(crc,
                                 &crc32::CASTAGNOLI_TABLE,
@@ -155,7 +175,7 @@ impl Segment {
 
         self.index.push((offset + ENTRY_HEADER_LEN, entry.len()));
 
-        Ok(Some(self.index.len() - 1))
+        Some((self.index.len() - 1, self.flusher.flush(offset + total_len)))
     }
 
     /// Returns the segment entry at the specified index, or `None` if no such
@@ -166,11 +186,9 @@ impl Segment {
             .map(|&(offset, len)| unsafe { &self.map().as_slice()[offset..offset +  len] })
     }
 
-    pub fn sync(&mut self) ->Result<()> {
+    pub fn flush(&mut self) -> Future<(), Error> {
         let len = self.len();
-        self.map_mut().flush_range(0, len)
-        //self.map_mut().flush()
-
+        self.flusher.flush(len)
     }
 
     /// Returns the capacity of the segment in bytes.
@@ -208,7 +226,7 @@ impl Segment {
     ///
     /// This need not be called in normal circumstances.
     pub fn reindex(&mut self) -> Result<()> {
-        let Segment { ref map, ref mut index, ref mut crc } = *self;
+        let Segment { ref map, ref mut index, ref mut crc, .. } = *self;
         index.clear();
 
         let mut buf = unsafe { map.get().as_slice() };
@@ -269,8 +287,9 @@ fn padding(len: usize) -> usize {
 #[cfg(test)]
 mod test {
     extern crate tempdir;
+    extern crate env_logger;
 
-    use std::io::Read;
+    use eventual::Async;
 
     use super::{SEGMENT_HEADER_LEN, Segment, padding};
 
@@ -300,6 +319,7 @@ mod test {
     }
 
     fn test_segment(len: usize) -> (Segment, tempdir::TempDir) {
+        let _ = env_logger::init();
         let dir = tempdir::TempDir::new("segment").unwrap();
         let mut path = dir.path().to_path_buf();
         path.push("test-segment");
@@ -308,6 +328,7 @@ mod test {
 
     #[test]
     fn test_create() {
+        let _ = env_logger::init();
         let segment = test_segment(4096).0;
         assert_eq!(SEGMENT_HEADER_LEN, segment.len());
         assert_eq!(4096, segment.capacity());
@@ -316,6 +337,7 @@ mod test {
 
     #[test]
     fn test_entries() {
+        let _ = env_logger::init();
         let mut segment = test_segment(4096).0;
         let entries: &[&[u8]] = &[b"",
                                   b"0",
@@ -330,7 +352,7 @@ mod test {
                                   b"0123456789"];
 
         for (index, entry) in entries.iter().enumerate() {
-            assert_eq!(index, segment.append(entry).unwrap().unwrap());
+            assert_eq!(index, segment.append(entry).unwrap().0);
         }
 
         for index in 0..entries.len() {
@@ -340,6 +362,7 @@ mod test {
 
     #[test]
     fn test_open() {
+        let _ = env_logger::init();
         let dir = tempdir::TempDir::new("segment").unwrap();
         let mut path = dir.path().to_path_buf();
         path.push("test-open");
@@ -358,12 +381,14 @@ mod test {
 
         {
             let mut segment = Segment::create(&path, 4096).unwrap();
-            for (index, entry) in entries.iter().enumerate() {
-                assert_eq!(index, segment.append(entry).unwrap().unwrap());
+            for (i, entry) in entries.iter().enumerate() {
+                let (index, future) = segment.append(entry).unwrap();
+                future.await().unwrap();
+                assert_eq!(i, index);
             }
         }
 
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert_eq!(4096, segment.capacity());
         assert_eq!(entries.len(), segment.count());
 
@@ -376,6 +401,7 @@ mod test {
     /// the old entries will not be indexed.
     #[test]
     fn test_overwrite() {
+        let _ = env_logger::init();
         let dir = tempdir::TempDir::new("segment").unwrap();
         let mut path = dir.path().to_path_buf();
         path.push("test-overwrite");
@@ -386,8 +412,10 @@ mod test {
 
         {
             let mut segment = Segment::create(&path, 4096).unwrap();
-            for (index, entry) in entries.iter().enumerate() {
-                assert_eq!(index, segment.append(entry).unwrap().unwrap());
+            for (i, entry) in entries.iter().enumerate() {
+                let (index, future) = segment.append(entry).unwrap();
+                future.await().unwrap();
+                assert_eq!(i, index);
             }
         }
 
