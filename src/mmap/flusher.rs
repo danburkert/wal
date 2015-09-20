@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::io::{Error, ErrorKind};
+use std::ops::Drop;
 
 use eventual::{Complete, Future};
 
@@ -20,7 +21,7 @@ impl Flusher {
 
         let (tx, rx) = channel::<(usize, Complete<(), Error>)>();
 
-        thread::spawn(move|| {
+        let thread = thread::spawn(move|| {
             let mut buf = VecDeque::new();
             let mut offset = 0;
 
@@ -65,6 +66,7 @@ impl Flusher {
 
         Flusher {
             tx: tx,
+            thread: thread,
         }
     }
 
@@ -78,13 +80,15 @@ impl Flusher {
     }
 }
 
-impl drop for Flusher {
-    pub fn drop(&mut self) {
+/*
+impl Drop for Flusher {
+    fn drop(&mut self) {
         // TODO: this will likely deadlock the thread when it is dropped; the channel probably
         // needs to be closed as well.
         let _ = self.thread.join();
     }
 }
+*/
 
 fn round_to_page(len: usize) -> usize {
     len - (len % PAGE_SIZE)
