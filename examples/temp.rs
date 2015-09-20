@@ -1,6 +1,6 @@
 extern crate wal;
 
-use wal::mmap_segment::Segment;
+use wal::mmap::Segment;
 use std::mem;
 
 

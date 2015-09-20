@@ -8,6 +8,8 @@ byteorder = "*"
 crc = "*"
 memmap = "*"
 rand = "*"
+eventual = "*"
+log = "*"
 
 [dev-dependencies]
 docopt = "*"

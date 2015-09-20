@@ -14,7 +14,7 @@ use histogram::{Histogram, HistogramConfig};
 use rand::Rng;
 use regex::Regex;
 
-use wal::mmap_segment::Segment;
+use wal::mmap::Segment;
 
 static USAGE: &'static str = "
 Usage:
