@@ -5,7 +5,7 @@ use std::io::{Error, ErrorKind};
 
 use eventual::{Complete, Future};
 
-use mmap::Map;
+use mmap::MmapHandle;
 
 pub struct Flusher {
     tx: Sender<(usize, Complete<(), Error>)>,
@@ -13,7 +13,7 @@ pub struct Flusher {
 
 impl Flusher {
 
-    pub fn with_offset(map: Map, initial_offset: usize) -> Flusher {
+    pub fn with_offset(map: MmapHandle, initial_offset: usize) -> Flusher {
         let (tx, rx) = channel::<(usize, Complete<(), Error>)>();
         thread::spawn(move || flush_loop(map, initial_offset, rx));
         Flusher { tx: tx }
@@ -28,7 +28,7 @@ impl Flusher {
     }
 }
 
-fn flush_loop(mut map: Map,
+fn flush_loop(mut map: MmapHandle,
               initial_offset: usize,
               rx: Receiver<(usize, Complete<(), Error>)>) {
     let mut completions = VecDeque::new();
@@ -46,7 +46,7 @@ fn flush_loop(mut map: Map,
 
         trace!("flushing: coalescing {} calls; segment range [{}, {}]",
                 completions.len(), offset, next_offset);
-        // TODO: investigate whether doing ranged flush is more performant.
+        // TODO: investigate whether doing a ranged flush is more performant.
         let result = mmap.flush();
         offset = next_offset;
 

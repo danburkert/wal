@@ -118,11 +118,11 @@ fn append(args: &Args) {
     let mut entries = 0usize;
     let mut time: u64 = time::precise_time_ns();
     let start_time: u64 = time;
-    while let Some((_, future)) = segment.append(&buf) {
+    while let Some(_) = segment.append(&buf) {
         entries += 1;
         if args.flag_batch != 0 && entries % args.flag_batch == 0 {
             let start_sync = time::precise_time_ns();
-            future.await().unwrap();
+            //future.await().unwrap();
             sync_hist.increment(time::precise_time_ns() - start_sync);
         }
         let new_time = time::precise_time_ns();
@@ -132,7 +132,7 @@ fn append(args: &Args) {
     };
 
     if args.flag_batch != 0 && entries % args.flag_batch != 0 {
-        segment.flush().await().unwrap();
+        //segment.flush().await().unwrap();
         let new_time = time::precise_time_ns();
         append_hist.increment(new_time - time);
     }
@@ -140,7 +140,7 @@ fn append(args: &Args) {
     let end_time = time::precise_time_ns();
 
     if args.flag_batch == 0 {
-        segment.flush().await().unwrap();
+        //segment.flush().await().unwrap();
         let flush_time = time::precise_time_ns() - end_time;
         println!("final sync latency: {}", format_duration(flush_time));
     }
