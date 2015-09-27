@@ -165,7 +165,6 @@ impl Segment {
         let padded_len = entry.len() + padding;
 
         let offset = self.size();
-        println!("offset: {}", offset);
 
         let mut crc = self.crc;
 
@@ -270,7 +269,6 @@ fn index_segment(segment: &[u8]) -> Result<(Vec<(usize, usize)>, Crc)> {
         return Err(Error::new(ErrorKind::InvalidData, "invalid segment length"));
     }
 
-    println!("segment: {:?}", &segment[..40]);
     if &segment[..SEGMENT_HEADER.len()] != SEGMENT_HEADER {
         return Err(Error::new(ErrorKind::InvalidData, "invalid segment header"));
     }
