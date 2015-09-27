@@ -30,16 +30,19 @@ impl MmapHandle {
             map: Arc::new(UnsafeCell::new(map)),
         }
     }
+}
 
-    /// Gets a shared reference to the memory map.
-    pub fn get(&self) -> &Mmap {
+impl AsRef<Mmap> for MmapHandle {
+    fn as_ref(&self) -> &Mmap {
         unsafe { &*self.map.get() }
     }
+}
 
-    /// Gets a mutable reference to the memory map.
-    pub fn get_mut(&mut self) -> &mut Mmap {
+impl AsMut<Mmap> for MmapHandle {
+    fn as_mut(&mut self) -> &mut Mmap {
         unsafe { &mut *self.map.get() }
     }
 }
+
 
 unsafe impl Send for MmapHandle { }

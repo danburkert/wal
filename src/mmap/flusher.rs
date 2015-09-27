@@ -1,7 +1,6 @@
-use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Result};
 
 use eventual::{Complete, Future};
 
@@ -31,12 +30,18 @@ impl Flusher {
             .map(|_| future)
             .unwrap_or(Future::error(Error::new(ErrorKind::Other, "wal segment flusher stopped")))
     }
+
+    pub fn reset(&self, mmap: MmapHandle) -> Result<()> {
+        self.tx
+            .send(FlushOp::Reset(mmap))
+            .map_err(|_| Error::new(ErrorKind::Other, "wal segment flusher stopped"))
+    }
 }
 
 fn flush_loop(mut mmap: MmapHandle, rx: Receiver<FlushOp>) {
     let mut completions: Vec<Complete<(), Error>> = Vec::new();
 
-    while let Ok(mut op) = rx.recv() {
+    while let Ok(op) = rx.recv() {
         match op {
             FlushOp::Flush(complete) => completions.push(complete),
             FlushOp::Reset(handle) => {
@@ -58,7 +63,7 @@ fn flush_loop(mut mmap: MmapHandle, rx: Receiver<FlushOp>) {
         debug!("flushing {} entries", completions.len());
 
         // TODO: investigate whether doing a ranged flush is more performant.
-        let result = mmap.get_mut().flush();
+        let result = mmap.as_mut().flush();
         match result {
             Ok(_) => {
                 for complete in completions.drain(..) {

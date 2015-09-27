@@ -118,8 +118,8 @@ impl Segment {
         let seed = rand::random();
 
         // Write and sync the header information.
-        copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.get_mut().as_mut_slice()[..4] });
-        LittleEndian::write_u32(unsafe { &mut mmap.get_mut().as_mut_slice()[4..] }, seed);
+        copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut().as_mut_slice()[..4] });
+        LittleEndian::write_u32(unsafe { &mut mmap.as_mut().as_mut_slice()[4..] }, seed);
 
         try!(file.sync_all());
         Ok(Segment {
@@ -139,7 +139,7 @@ impl Segment {
                                     .write(true)
                                     .create(false)
                                     .open(&path));
-        let (index, crc) = try!(index_segment(unsafe { mmap.get().as_slice() }));
+        let (index, crc) = try!(rebuild_index(unsafe { mmap.as_ref().as_slice() }));
         Ok(Segment {
             mmap: mmap,
             file: file,
@@ -201,7 +201,7 @@ impl Segment {
     /// Each entry is stored with a header and padding, so the entire capacity
     /// will not be available for entry data.
     pub fn capacity(&self) -> usize {
-        self.mmap.get().len()
+        self.mmap.as_ref().len()
     }
 
     /// Returns the total number of bytes used to store the entries, including
@@ -229,15 +229,15 @@ impl Segment {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.mmap.get_mut().flush()
+        self.mmap.as_mut().flush()
     }
 
     fn as_slice(&self) -> &[u8] {
-        unsafe { self.mmap.get().as_slice() }
+        unsafe { self.mmap.as_ref().as_slice() }
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { self.mmap.get_mut().as_mut_slice() }
+        unsafe { self.mmap.as_mut().as_mut_slice() }
     }
 }
 
@@ -264,7 +264,7 @@ fn padding(len: usize) -> usize {
 ///
 /// If the CRC of any entry does not match, then parsing stops and the entries
 /// up until that point are returned.
-fn index_segment(segment: &[u8]) -> Result<(Vec<(usize, usize)>, Crc)> {
+fn rebuild_index(segment: &[u8]) -> Result<(Vec<(usize, usize)>, Crc)> {
     if segment.len() < HEADER_LEN {
         return Err(Error::new(ErrorKind::InvalidData, "invalid segment length"));
     }
@@ -299,8 +299,6 @@ fn index_segment(segment: &[u8]) -> Result<(Vec<(usize, usize)>, Crc)> {
 mod test {
     extern crate tempdir;
     extern crate env_logger;
-
-    use eventual::Async;
 
     use super::{HEADER_LEN, Segment, padding};
 
