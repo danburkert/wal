@@ -1,4 +1,4 @@
-#![feature(drain)]
+#![feature(drain, slice_patterns)]
 
 extern crate byteorder;
 extern crate crc;
