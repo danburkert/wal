@@ -6,7 +6,7 @@ use eventual::{Complete, Future};
 
 use mmap::MmapHandle;
 
-pub struct Flusher {
+pub struct SegmentFlusher {
     tx: Sender<FlushOp>,
 }
 
@@ -15,12 +15,12 @@ enum FlushOp {
     Reset(MmapHandle),
 }
 
-impl Flusher {
+impl SegmentFlusher {
 
-    pub fn with_offset(mmap: MmapHandle) -> Flusher {
+    pub fn with_offset(mmap: MmapHandle) -> SegmentFlusher {
         let (tx, rx) = channel::<FlushOp>();
         thread::spawn(move || flush_loop(mmap, rx));
-        Flusher { tx: tx }
+        SegmentFlusher { tx: tx }
     }
 
     pub fn flush(&self) -> Future<(), Error> {

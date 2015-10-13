@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use memmap::Mmap;
 
-pub use self::segment::Segment;
-pub use self::flusher::Flusher;
 pub use self::creator::SegmentCreator;
+pub use self::flusher::SegmentFlusher;
+pub use self::segment::Segment;
 
 /// A cloneable handle to a memory map.
 ///
@@ -75,7 +75,7 @@ enum WalSegment {
 pub struct Wal {
     open_segment: OpenSegment,
     closed_segments: VecDeque<ClosedSegment>,
-    flusher: Flusher,
+    flusher: SegmentFlusher,
     creator: SegmentCreator,
 }
 
