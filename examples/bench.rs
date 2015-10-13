@@ -16,7 +16,7 @@ use histogram::{Histogram, HistogramConfig};
 use rand::Rng;
 use regex::Regex;
 
-use wal::mmap::Segment;
+use wal::Segment;
 
 static USAGE: &'static str = "
 Usage:
@@ -123,10 +123,10 @@ fn append(args: &Args) {
         if args.flag_batch != 0 && entries % args.flag_batch == 0 {
             let start_sync = time::precise_time_ns();
             //future.await().unwrap();
-            sync_hist.increment(time::precise_time_ns() - start_sync);
+            sync_hist.increment(time::precise_time_ns() - start_sync).unwrap();
         }
         let new_time = time::precise_time_ns();
-        append_hist.increment(new_time - time);
+        append_hist.increment(new_time - time).unwrap();
         time = new_time;
         rand::weak_rng().fill_bytes(&mut buf);
     };
@@ -134,7 +134,7 @@ fn append(args: &Args) {
     if args.flag_batch != 0 && entries % args.flag_batch != 0 {
         //segment.flush().await().unwrap();
         let new_time = time::precise_time_ns();
-        append_hist.increment(new_time - time);
+        append_hist.increment(new_time - time).unwrap();
     }
 
     let end_time = time::precise_time_ns();

@@ -17,7 +17,7 @@ enum FlushOp {
 
 impl SegmentFlusher {
 
-    pub fn with_offset(mmap: MmapHandle) -> SegmentFlusher {
+    pub fn new(mmap: MmapHandle) -> SegmentFlusher {
         let (tx, rx) = channel::<FlushOp>();
         thread::spawn(move || flush_loop(mmap, rx));
         SegmentFlusher { tx: tx }

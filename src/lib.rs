@@ -14,15 +14,21 @@ mod segment;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{Error, ErrorKind, Result};
+use std::mem;
+use std::ops;
 use std::path::Path;
 use std::str::FromStr;
 
+use eventual::Future;
+
 use segment::creator::SegmentCreator;
 use segment::flusher::SegmentFlusher;
-use segment::Segment;
+pub use segment::Segment;
 
 /// An open segment and its ID.
-struct OpenSegment {
+///
+/// TODO: this shouldn't be public
+pub struct OpenSegment {
     pub id: u64,
     pub segment: Segment,
 }
@@ -42,8 +48,8 @@ enum WalSegment {
 pub struct Wal {
     open_segment: OpenSegment,
     closed_segments: VecDeque<ClosedSegment>,
-    flusher: SegmentFlusher,
     creator: SegmentCreator,
+    flusher: SegmentFlusher,
 }
 
 impl Wal {
@@ -52,7 +58,7 @@ impl Wal {
         let mut open_segments: Vec<OpenSegment> = Vec::new();
         let mut closed_segments: Vec<ClosedSegment> = Vec::new();
 
-        for entry in try!(fs::read_dir(path)) {
+        for entry in try!(fs::read_dir(&path)) {
             match try!(open_dir_entry(try!(entry))) {
                 WalSegment::Open(open_segment) => open_segments.push(open_segment),
                 WalSegment::Closed(closed_segment) => closed_segments.push(closed_segment),
@@ -110,24 +116,56 @@ impl Wal {
             }
         }
 
+        let closed_segments = closed_segments.into_iter().collect();
 
+        let mut creator = SegmentCreator::new(&path, unused_segments);
 
-        /*
-        struct Wal {
+        let open_segment = match open_segment {
+            Some(segment) => segment,
+            None => try!(creator.next()),
+        };
+
+        let flusher = SegmentFlusher::new(open_segment.segment.mmap());
+
+        Ok(Wal {
             open_segment: open_segment,
-            closed_segments: closed_segments.into_iter().collect(),
-            flusher: Flusher,
-            creator: SegmentCreator,
+            closed_segments: closed_segments,
+            creator: creator,
+            flusher: flusher,
+        })
+    }
+
+    fn retire_open_segment(&mut self) -> Result<()> {
+        // TODO: time the next call
+        let mut segment = try!(self.creator.next());
+        mem::swap(&mut self.open_segment, &mut segment);
+        let len = self.closed_segments.len();
+        let start_index = if len > 0 { self.closed_segments[len - 1].end_index + 1 } else { 0 };
+        self.flusher.reset(segment.segment.mmap());
+        self.closed_segments.push_back(try!(close_segment(segment, start_index)));
+        Ok(())
+    }
+
+    pub fn append<T>(&mut self, entry: &T) -> Future<(), Error> where T: ops::Deref<Target=[u8]> {
+        if entry.len() > self.open_segment.segment.remaining_size() {
+            if let Err(error) = self.retire_open_segment() {
+                return Future::error(error);
+            }
         }
-        */
-        unimplemented!()
+
+        // TODO: figure out a real answer for entries bigger the segment size.
+        self.open_segment.segment.append(entry).unwrap();
+        self.flusher.flush()
     }
 }
 
-fn close_segment(OpenSegment { segment, .. }: OpenSegment, start_index: u64) -> Result<ClosedSegment> {
+fn close_segment(OpenSegment { mut segment, .. }: OpenSegment, start_index: u64) -> Result<ClosedSegment> {
     let end_index = start_index + segment.len() as u64;
 
-    unimplemented!()
+    segment.rename(format!("segment-closed-{}-{}", start_index, end_index));
+    Ok(ClosedSegment { start_index: start_index,
+                       end_index: end_index,
+                       segment: segment })
 }
 
 fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
@@ -158,5 +196,21 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
                                                   segment: segment }))
         },
         _ => Err(error()),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    extern crate tempdir;
+    extern crate env_logger;
+
+    use super::Wal;
+
+    #[test]
+    fn test_wal() {
+        let _ = env_logger::init();
+        let dir = tempdir::TempDir::new("segment").unwrap();
+        let wal = Wal::open(&dir.path()).unwrap();
+
     }
 }

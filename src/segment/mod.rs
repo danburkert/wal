@@ -262,6 +262,10 @@ impl Segment {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn mmap(&self) -> MmapHandle {
+        self.mmap.clone()
+    }
 }
 
 /// Copies data from `src` to `dst`
