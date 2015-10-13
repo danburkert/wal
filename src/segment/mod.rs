@@ -46,6 +46,9 @@
 //! of the entry to a multiple of 8, followed by the CRC code of the length,
 //! data, and padding.
 
+pub mod creator;
+pub mod flusher;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{
     Error,

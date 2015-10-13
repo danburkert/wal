@@ -1,10 +1,9 @@
-use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
-use mmap::Segment;
+use segment::Segment;
 
 pub struct SegmentCreator {
     /// Receive channel for new segments.
