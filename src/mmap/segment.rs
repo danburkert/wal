@@ -46,7 +46,7 @@
 //! of the entry to a multiple of 8, followed by the CRC code of the length,
 //! data, and padding.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{
     Error,
     ErrorKind,
@@ -109,6 +109,7 @@ impl Segment {
                                     .open(&path));
 
         try!(file.set_len(capacity as u64));
+        // TODO: sync directory
 
         let mut mmap = MmapHandle::new(try!(Mmap::open_with_offset(&file,
                                                                    Protection::ReadWrite,
@@ -223,6 +224,21 @@ impl Segment {
         unpadded & !7
     }
 
+    pub fn delete(self) -> Result<()> {
+        let Segment { path, .. } = self;
+        fs::remove_file(path)
+    }
+
+    /// Renames the segment.
+    ///
+    /// The caller is responsible for syncing the directory in order to
+    /// guarantee that the rename is durable.
+    pub fn rename<P>(&mut self, path: P) -> Result<()> where P: AsRef<Path> {
+        try!(fs::rename(&self.path, &path));
+        self.path = path.as_ref().to_path_buf();
+        Ok(())
+    }
+
     /// Returns the number of entries in the segment.
     pub fn len(&self) -> usize {
         self.index.len()
@@ -238,6 +254,10 @@ impl Segment {
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { self.mmap.as_mut().as_mut_slice() }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
