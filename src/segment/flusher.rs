@@ -45,6 +45,7 @@ fn flush_loop(mut mmap: MmapHandle, rx: Receiver<FlushOp>) {
         match op {
             FlushOp::Flush(complete) => completions.push(complete),
             FlushOp::Reset(handle) => {
+                debug!("Reseting flusher with new mmap");
                 mmap = handle;
                 continue;
             }
@@ -54,13 +55,14 @@ fn flush_loop(mut mmap: MmapHandle, rx: Receiver<FlushOp>) {
             match op {
                 FlushOp::Flush(complete) => completions.push(complete),
                 FlushOp::Reset(handle) => {
+                    debug!("Reseting flusher with new mmap");
                     mmap = handle;
                     break;
                 }
             }
         }
 
-        debug!("flushing {} entries", completions.len());
+        trace!("flushing {} entries", completions.len());
 
         // TODO: investigate whether doing a ranged flush is more performant.
         let result = mmap.as_mut().flush();

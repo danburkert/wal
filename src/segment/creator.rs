@@ -25,7 +25,7 @@ impl SegmentCreator {
         let (tx, rx) = sync_channel::<OpenSegment>(3);
 
         let dir = dir.as_ref().to_path_buf();
-        let thread = thread::spawn(move || create_loop(tx, dir, 8192, existing));
+        let thread = thread::spawn(move || create_loop(tx, dir, 8 * 1024 * 1024, existing));
         SegmentCreator { rx: rx, thread: Some(thread) }
     }
 
@@ -64,17 +64,14 @@ fn create_loop(tx: SyncSender<OpenSegment>,
     let dir = try!(File::open(&path));
 
     while cont {
-        path.push(format!("open-{}.wal", id));
+        path.push(format!("open-{}", id));
         let segment = OpenSegment { id: id, segment: try!(Segment::create(&path, capacity)) };
         path.pop();
         id += 1;
         // Sync the directory, guaranteeing that the segment file is durably
         // stored on the filesystem.
         try!(dir.sync_all());
-
-        if let Err(error) = tx.send(segment) {
-            cont = false;
-        }
+        cont = tx.send(segment).is_ok();
     }
 
     info!("shutting down");

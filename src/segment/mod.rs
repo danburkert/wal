@@ -259,7 +259,7 @@ impl Segment {
         unsafe { self.mmap.as_mut().as_mut_slice() }
     }
 
-    fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 

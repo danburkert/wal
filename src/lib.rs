@@ -12,7 +12,7 @@ mod mmap;
 mod segment;
 
 use std::collections::VecDeque;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::ops;
@@ -20,6 +20,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use eventual::Future;
+use eventual::Async;
 
 use segment::creator::SegmentCreator;
 use segment::flusher::SegmentFlusher;
@@ -50,6 +51,7 @@ pub struct Wal {
     closed_segments: VecDeque<ClosedSegment>,
     creator: SegmentCreator,
     flusher: SegmentFlusher,
+    dir: File,
 }
 
 impl Wal {
@@ -132,6 +134,7 @@ impl Wal {
             closed_segments: closed_segments,
             creator: creator,
             flusher: flusher,
+            dir: try!(File::open(path)),
         })
     }
 
@@ -141,7 +144,7 @@ impl Wal {
         mem::swap(&mut self.open_segment, &mut segment);
         let len = self.closed_segments.len();
         let start_index = if len > 0 { self.closed_segments[len - 1].end_index + 1 } else { 0 };
-        self.flusher.reset(segment.segment.mmap());
+        try!(self.flusher.reset(segment.segment.mmap()));
         self.closed_segments.push_back(try!(close_segment(segment, start_index)));
         Ok(())
     }
@@ -155,14 +158,20 @@ impl Wal {
 
         // TODO: figure out a real answer for entries bigger the segment size.
         self.open_segment.segment.append(entry).unwrap();
+        self.open_segment.segment.flush();
         self.flusher.flush()
     }
 }
 
-fn close_segment(OpenSegment { mut segment, .. }: OpenSegment, start_index: u64) -> Result<ClosedSegment> {
+fn close_segment(OpenSegment { mut segment, id }: OpenSegment,
+                 start_index: u64)
+                 -> Result<ClosedSegment> {
     let end_index = start_index + segment.len() as u64;
 
-    segment.rename(format!("segment-closed-{}-{}", start_index, end_index));
+    let new_path = segment.path()
+                          .with_file_name(format!("closed-{}-{}", start_index, end_index));
+    try!(segment.rename(new_path));
+    debug!("closing open segment {} with entries {} through {}", id, start_index, end_index);
     Ok(ClosedSegment { start_index: start_index,
                        end_index: end_index,
                        segment: segment })
@@ -182,12 +191,12 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
 
     let filename = try!(entry.file_name().into_string().map_err(|_| error()));
     match &*filename.split('-').collect::<Vec<&str>>() {
-        ["segment", "open", id] => {
+        ["open", id] => {
             let id = try!(u64::from_str(id).map_err(|_| error()));
             let segment = try!(Segment::open(entry.path()));
             Ok(WalSegment::Open(OpenSegment { segment: segment, id: id }))
         },
-        ["segment", "closed", start, end] => {
+        ["closed", start, end] => {
             let start = try!(u64::from_str(start).map_err(|_| error()));
             let end = try!(u64::from_str(end).map_err(|_| error()));
             let segment = try!(Segment::open(entry.path()));
@@ -204,13 +213,36 @@ mod test {
     extern crate tempdir;
     extern crate env_logger;
 
+    use eventual::{Async, Future, Join};
+
     use super::Wal;
 
     #[test]
-    fn test_wal() {
+    fn test_insert() {
         let _ = env_logger::init();
-        let dir = tempdir::TempDir::new("segment").unwrap();
-        let wal = Wal::open(&dir.path()).unwrap();
+        //let dir = tempdir::TempDir::new("wal").unwrap();
+        let mut wal = Wal::open("/data/hdd").unwrap();
 
+        let entry: &[u8] = &[42u8; 4096];
+        let mut completions = Vec::with_capacity(10000);
+
+        for _ in 1..10 {
+            completions.push(wal.append(&entry));
+        }
+
+        let (c, f) = Future::pair();
+        completions.join(c);
+        f.await().unwrap();
+    }
+
+    /// Tests that two Wal instances can not coexist for the same directory.
+    #[test]
+    fn test_exclusive_lock() {
+        let _ = env_logger::init();
+        let dir = tempdir::TempDir::new("wal").unwrap();
+        let wal = Wal::open(&dir.path()).unwrap();
+        assert!(Wal::open(&dir.path()).is_err());
+        drop(wal);
+        Wal::open(&dir.path()).unwrap();
     }
 }
