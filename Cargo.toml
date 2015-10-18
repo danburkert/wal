@@ -6,15 +6,16 @@ authors = ["Dan Burkert <dan@danburkert.com>"]
 [dependencies]
 byteorder = "*"
 crc = "*"
-memmap = "*"
-rand = "*"
 eventual = "*"
 log = "*"
+memmap = "*"
+rand = "*"
 
 [dev-dependencies]
 docopt = "*"
 env_logger = "*"
 histogram = "*"
+quickcheck = "*"
 regex = "*"
 rustc-serialize = "*"
 tempdir = "*"

@@ -11,12 +11,14 @@ extern crate log;
 mod mmap;
 mod segment;
 
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::ops;
 use std::path::Path;
+use std::ptr;
 use std::str::FromStr;
 
 use eventual::Future;
@@ -48,7 +50,7 @@ enum WalSegment {
 
 pub struct Wal {
     open_segment: OpenSegment,
-    closed_segments: VecDeque<ClosedSegment>,
+    closed_segments: Vec<ClosedSegment>,
     creator: SegmentCreator,
     flusher: SegmentFlusher,
     dir: File,
@@ -84,7 +86,6 @@ impl Wal {
             prev_end = Some(end_index)
         }
 
-
         // Validate the open segments.
         open_segments.sort_by(|&OpenSegment { id: left_id, .. },
                                &OpenSegment { id: ref right_id, .. }| {
@@ -118,8 +119,6 @@ impl Wal {
             }
         }
 
-        let closed_segments = closed_segments.into_iter().collect();
-
         let mut creator = SegmentCreator::new(&path, unused_segments);
 
         let open_segment = match open_segment {
@@ -145,7 +144,7 @@ impl Wal {
         let len = self.closed_segments.len();
         let start_index = if len > 0 { self.closed_segments[len - 1].end_index + 1 } else { 0 };
         try!(self.flusher.reset(segment.segment.mmap()));
-        self.closed_segments.push_back(try!(close_segment(segment, start_index)));
+        self.closed_segments.push(try!(close_segment(segment, start_index)));
         Ok(())
     }
 
@@ -160,6 +159,40 @@ impl Wal {
         self.open_segment.segment.append(entry).unwrap();
         self.open_segment.segment.flush();
         self.flusher.flush()
+    }
+
+    pub fn entry(&self, index: u64) -> Option<&[u8]> {
+        let open_start_index = self.closed_segments
+                                   .last()
+                                   .map(|closed_segment| closed_segment.end_index as u64 + 1)
+                                   .unwrap_or(0);
+        if index >= open_start_index {
+            return self.open_segment.segment.entry((index - open_start_index) as usize);
+        }
+
+        match self.closed_segments.binary_search_by(|closed_segment| {
+            if index >= closed_segment.start_index {
+                if index <= closed_segment.end_index {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            } else {
+                Ordering::Less
+            }
+        }) {
+            Ok(segment_index) => {
+                let segment = &self.closed_segments[segment_index];
+                segment.segment.entry((index - segment.start_index) as usize)
+            },
+            Err(entry) => {
+                assert!(index < self.closed_segments
+                                    .first()
+                                    .map(|closed_segment| closed_segment.start_index)
+                                    .unwrap_or(0));
+                None
+            }
+        }
     }
 }
 
@@ -218,7 +251,7 @@ mod test {
     use super::Wal;
 
     #[test]
-    fn test_insert() {
+    fn test_append() {
         let _ = env_logger::init();
         //let dir = tempdir::TempDir::new("wal").unwrap();
         let mut wal = Wal::open("/data/hdd").unwrap();
