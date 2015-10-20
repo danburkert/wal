@@ -1,4 +1,6 @@
 #![feature(drain, slice_patterns)]
+#![cfg_attr(test, feature(custom_attribute, plugin))]
+#![cfg_attr(test, plugin(quickcheck_macros))]
 
 extern crate byteorder;
 extern crate crc;
@@ -245,16 +247,77 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
 mod test {
     extern crate tempdir;
     extern crate env_logger;
+    extern crate quickcheck;
+
+    use std::error::Error;
+    use std::mem;
 
     use eventual::{Async, Future, Join};
+    use test::quickcheck::TestResult;
 
     use super::Wal;
+
+    /// Check that entries appended to the write ahead log can be read back.
+    #[test]
+    fn check_wal() {
+        let _ = env_logger::init();
+        fn wal(entries: Vec<Vec<u8>>) -> TestResult {
+            let dir = tempdir::TempDir::new("wal").unwrap();
+            let mut wal = Wal::open(&dir.path()).unwrap();
+
+            for entry in &entries {
+                if let Err(error) = wal.append(entry).await() {
+                    return TestResult::error(error.description());
+                }
+            }
+
+            for (index, expected) in entries.iter().enumerate() {
+                match wal.entry(index as u64) {
+                    Some(entry) if entry != &expected[..] => return TestResult::failed(),
+                    None => return TestResult::failed(),
+                    _ => (),
+                }
+            }
+            TestResult::passed()
+        }
+
+        quickcheck::quickcheck(wal as fn(Vec<Vec<u8>>) -> TestResult);
+    }
+
+    /// Check that the Wal will read previously written entries.
+    #[test]
+    fn check_wal_reopen() {
+        let _ = env_logger::init();
+        fn wal(entries: Vec<Vec<u8>>) -> TestResult {
+            let dir = tempdir::TempDir::new("wal").unwrap();
+
+            // Insert all of the entries. Reopen the Wal after every entry
+            // without closing it properly.
+            for entry in &entries {
+                let mut wal = Wal::open(&dir.path()).unwrap();
+                wal.append(entry);
+            }
+
+            let mut wal = Wal::open(&dir.path()).unwrap();
+            // Check that all of the entries are present.
+            for (index, expected) in entries.iter().enumerate() {
+                match wal.entry(index as u64) {
+                    Some(entry) if entry != &expected[..] => return TestResult::failed(),
+                    None => return TestResult::failed(),
+                    _ => (),
+                }
+            }
+            TestResult::passed()
+        }
+
+        quickcheck::quickcheck(wal as fn(Vec<Vec<u8>>) -> TestResult);
+    }
 
     #[test]
     fn test_append() {
         let _ = env_logger::init();
-        //let dir = tempdir::TempDir::new("wal").unwrap();
-        let mut wal = Wal::open("/data/hdd").unwrap();
+        let dir = tempdir::TempDir::new("wal").unwrap();
+        let mut wal = Wal::open(&dir.path()).unwrap();
 
         let entry: &[u8] = &[42u8; 4096];
         let mut completions = Vec::with_capacity(10000);
