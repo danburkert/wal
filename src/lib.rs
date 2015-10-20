@@ -5,6 +5,7 @@
 extern crate byteorder;
 extern crate crc;
 extern crate eventual;
+extern crate fs2;
 extern crate memmap;
 extern crate rand;
 #[macro_use]
@@ -295,7 +296,7 @@ mod test {
             // without closing it properly.
             for entry in &entries {
                 let mut wal = Wal::open(&dir.path()).unwrap();
-                wal.append(entry);
+                let _ = wal.append(entry);
             }
 
             let mut wal = Wal::open(&dir.path()).unwrap();
@@ -333,12 +334,16 @@ mod test {
 
     /// Tests that two Wal instances can not coexist for the same directory.
     #[test]
-    fn test_exclusive_lock() {
+    fn test_exclusive_lock2() {
         let _ = env_logger::init();
         let dir = tempdir::TempDir::new("wal").unwrap();
-        let wal = Wal::open(&dir.path()).unwrap();
-        assert!(Wal::open(&dir.path()).is_err());
+        let mut wal = Wal::open(&dir.path()).unwrap();
+        let entry: &[u8] = &b"foo"[..];
+        wal.append(&entry).await().unwrap();
+
+        let wal2 = Wal::open(&dir.path());
+        assert!(wal2.is_err() || wal2.unwrap().entry(0).is_some());
         drop(wal);
-        Wal::open(&dir.path()).unwrap();
+        assert!(Wal::open(&dir.path()).unwrap().entry(0).is_some());
     }
 }

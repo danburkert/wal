@@ -7,6 +7,7 @@ authors = ["Dan Burkert <dan@danburkert.com>"]
 byteorder = "*"
 crc = "*"
 eventual = "*"
+fs2 = "*"
 log = "*"
 memmap = "*"
 rand = "*"

@@ -62,6 +62,7 @@ use std::ptr;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
+use fs2::FileExt;
 use memmap::{Mmap, Protection};
 use rand;
 use mmap::MmapHandle;
@@ -110,6 +111,8 @@ impl Segment {
                                     .write(true)
                                     .create(true)
                                     .open(&path));
+
+        try!(file.try_lock_exclusive());
 
         try!(file.set_len(capacity as u64));
         // TODO: sync directory
@@ -360,6 +363,13 @@ mod test {
 
     #[test]
     fn test_create() {
+        let _ = env_logger::init();
+        let (segment, dir) = test_segment(4096);
+        assert!(Segment::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn test_exclusive_lock() {
         let _ = env_logger::init();
         let segment = test_segment(4096).0;
         assert_eq!(HEADER_LEN, segment.size());
