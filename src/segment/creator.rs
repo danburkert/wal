@@ -92,8 +92,8 @@ mod test {
         let dir = tempdir::TempDir::new("segment").unwrap();
         let mut creator = SegmentCreator::new(&dir.path(), vec![]);
 
-        for i in 0..10 {
-            let segment = creator.next();
+        for _ in 0..10 {
+            let _ = creator.next();
         }
     }
 }

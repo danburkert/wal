@@ -15,17 +15,14 @@ mod mmap;
 mod segment;
 
 use std::cmp::Ordering;
-use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::ops;
 use std::path::Path;
-use std::ptr;
 use std::str::FromStr;
 
 use eventual::Future;
-use eventual::Async;
 
 use segment::creator::SegmentCreator;
 use segment::flusher::SegmentFlusher;
@@ -160,7 +157,6 @@ impl Wal {
 
         // TODO: figure out a real answer for entries bigger the segment size.
         self.open_segment.segment.append(entry).unwrap();
-        self.open_segment.segment.flush();
         self.flusher.flush()
     }
 
@@ -188,7 +184,7 @@ impl Wal {
                 let segment = &self.closed_segments[segment_index];
                 segment.segment.entry((index - segment.start_index) as usize)
             },
-            Err(entry) => {
+            Err(..) => {
                 assert!(index < self.closed_segments
                                     .first()
                                     .map(|closed_segment| closed_segment.start_index)
@@ -251,7 +247,6 @@ mod test {
     extern crate quickcheck;
 
     use std::error::Error;
-    use std::mem;
 
     use eventual::{Async, Future, Join};
     use test::quickcheck::TestResult;
@@ -299,7 +294,7 @@ mod test {
                 let _ = wal.append(entry);
             }
 
-            let mut wal = Wal::open(&dir.path()).unwrap();
+            let wal = Wal::open(&dir.path()).unwrap();
             // Check that all of the entries are present.
             for (index, expected) in entries.iter().enumerate() {
                 match wal.entry(index as u64) {
@@ -321,7 +316,7 @@ mod test {
         let mut wal = Wal::open(&dir.path()).unwrap();
 
         let entry: &[u8] = &[42u8; 4096];
-        let mut completions = Vec::with_capacity(10000);
+        let mut completions = Vec::new();
 
         for _ in 1..10 {
             completions.push(wal.append(&entry));

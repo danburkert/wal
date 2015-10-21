@@ -364,7 +364,7 @@ mod test {
     #[test]
     fn test_create() {
         let _ = env_logger::init();
-        let (segment, dir) = test_segment(4096);
+        let (_, dir) = test_segment(4096);
         assert!(Segment::open(dir.path()).is_err());
     }
 
