@@ -23,13 +23,31 @@ use std::path::Path;
 use std::str::FromStr;
 use std::fmt;
 
-
 use eventual::Future;
 use fs2::FileExt;
 
 use segment::creator::SegmentCreator;
 use segment::flusher::SegmentFlusher;
 pub use segment::Segment;
+
+#[derive(Debug)]
+pub struct WalOptions {
+    /// The segment capacity. Defaults to 32MiB.
+    pub segment_capacity: usize,
+
+    /// The number of segments to create ahead of time, so that appends never
+    /// need to wait on creating a new segment.
+    pub segment_queue_len: usize,
+}
+
+impl Default for WalOptions {
+    fn default() -> WalOptions {
+        WalOptions {
+            segment_capacity: 32 * 1024 * 1024,
+            segment_queue_len: 0,
+        }
+    }
+}
 
 /// An open segment and its ID.
 ///
@@ -61,6 +79,10 @@ pub struct Wal {
 
 impl Wal {
     pub fn open<P>(path: P) -> Result<Wal> where P: AsRef<Path> {
+        Wal::with_options(path, &WalOptions::default())
+    }
+
+    pub fn with_options<P>(path: P, options: &WalOptions) -> Result<Wal> where P: AsRef<Path> {
         let dir = try!(File::open(&path));
         try!(dir.try_lock_exclusive());
 
@@ -125,7 +147,10 @@ impl Wal {
             }
         }
 
-        let mut creator = SegmentCreator::new(&path, unused_segments);
+        let mut creator = SegmentCreator::new(&path,
+                                              unused_segments,
+                                              options.segment_capacity,
+                                              options.segment_queue_len);
 
         let open_segment = match open_segment {
             Some(segment) => segment,

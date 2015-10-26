@@ -21,11 +21,14 @@ impl SegmentCreator {
     /// Creates a new segment creator.
     ///
     /// The segment creator must be started before new segments will be created.
-    pub fn new<P>(dir: P, existing: Vec<OpenSegment>) -> SegmentCreator where P: AsRef<Path> {
-        let (tx, rx) = sync_channel::<OpenSegment>(3);
+    pub fn new<P>(dir: P,
+                  existing: Vec<OpenSegment>,
+                  segment_capacity: usize,
+                  segment_queue_len: usize) -> SegmentCreator where P: AsRef<Path> {
+        let (tx, rx) = sync_channel::<OpenSegment>(segment_queue_len);
 
         let dir = dir.as_ref().to_path_buf();
-        let thread = thread::spawn(move || create_loop(tx, dir, 8 * 1024 * 1024, existing));
+        let thread = thread::spawn(move || create_loop(tx, dir, segment_capacity, existing));
         SegmentCreator { rx: Some(rx), thread: Some(thread) }
     }
 
@@ -101,7 +104,7 @@ mod test {
     fn test_create_segments() {
         let _ = env_logger::init();
         let dir = tempdir::TempDir::new("segment").unwrap();
-        let mut creator = SegmentCreator::new(&dir.path(), vec![]);
+        let mut creator = SegmentCreator::new(&dir.path(), vec![], 1, 1024);
 
         for _ in 0..10 {
             let _ = creator.next();
