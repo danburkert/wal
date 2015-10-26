@@ -286,12 +286,11 @@ mod test {
         let _ = env_logger::init();
         fn wal(entries: Vec<Vec<u8>>) -> TestResult {
             let dir = tempdir::TempDir::new("wal").unwrap();
-
-            // Insert all of the entries. Reopen the Wal after every entry
-            // without closing it properly.
-            for entry in &entries {
+            {
                 let mut wal = Wal::open(&dir.path()).unwrap();
-                let _ = wal.append(entry);
+                for entry in &entries {
+                    let _ = wal.append(entry);
+                }
             }
 
             let wal = Wal::open(&dir.path()).unwrap();

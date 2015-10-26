@@ -93,7 +93,7 @@ mod test {
         let mut creator = SegmentCreator::new(&dir.path(), vec![]);
 
         for _ in 0..10 {
-            let _ = creator.next();
+            let segment = creator.next();
         }
     }
 }
