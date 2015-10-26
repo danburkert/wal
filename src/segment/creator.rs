@@ -9,7 +9,7 @@ use OpenSegment;
 
 pub struct SegmentCreator {
     /// Receive channel for new segments.
-    rx: Receiver<OpenSegment>,
+    rx: Option<Receiver<OpenSegment>>,
     /// The segment creator thread.
     ///
     /// Used for retrieving error upon failure.
@@ -26,12 +26,12 @@ impl SegmentCreator {
 
         let dir = dir.as_ref().to_path_buf();
         let thread = thread::spawn(move || create_loop(tx, dir, 8 * 1024 * 1024, existing));
-        SegmentCreator { rx: rx, thread: Some(thread) }
+        SegmentCreator { rx: Some(rx), thread: Some(thread) }
     }
 
     /// Retrieves the next segment.
     pub fn next(&mut self) -> Result<OpenSegment> {
-        self.rx.recv().map_err(|_| {
+        self.rx.as_mut().unwrap().recv().map_err(|_| {
             match self.thread.take().map(|join_handle| join_handle.join()) {
                 Some(Ok(Err(error))) => error,
                 None => Error::new(ErrorKind::Other, "segment creator thread already failed"),
@@ -40,6 +40,17 @@ impl SegmentCreator {
                 Some(Err(_)) => unreachable!("segment creator thread panicked"),
             }
         })
+    }
+}
+
+impl Drop for SegmentCreator {
+    fn drop(&mut self) {
+        drop(self.rx.take());
+        self.thread.take().map(|join_handle| {
+            if let Err(error) = join_handle.join() {
+                warn!("Error while shutting down segment creator: {:?}", error);
+            }
+        });
     }
 }
 
@@ -93,7 +104,7 @@ mod test {
         let mut creator = SegmentCreator::new(&dir.path(), vec![]);
 
         for _ in 0..10 {
-            let segment = creator.next();
+            let _ = creator.next();
         }
     }
 }

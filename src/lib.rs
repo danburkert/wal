@@ -21,8 +21,11 @@ use std::mem;
 use std::ops;
 use std::path::Path;
 use std::str::FromStr;
+use std::fmt;
+
 
 use eventual::Future;
+use fs2::FileExt;
 
 use segment::creator::SegmentCreator;
 use segment::flusher::SegmentFlusher;
@@ -58,6 +61,9 @@ pub struct Wal {
 
 impl Wal {
     pub fn open<P>(path: P) -> Result<Wal> where P: AsRef<Path> {
+        let dir = try!(File::open(&path));
+        try!(dir.try_lock_exclusive());
+
         // Holds open segments in the directory.
         let mut open_segments: Vec<OpenSegment> = Vec::new();
         let mut closed_segments: Vec<ClosedSegment> = Vec::new();
@@ -133,7 +139,7 @@ impl Wal {
             closed_segments: closed_segments,
             creator: creator,
             flusher: flusher,
-            dir: try!(File::open(path)),
+            dir: dir,
         })
     }
 
@@ -195,6 +201,13 @@ impl Wal {
     }
 }
 
+impl fmt::Debug for Wal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Wal {{ segment_count: {} }}",
+               self.closed_segments.len() + 1)
+    }
+}
+
 fn close_segment(OpenSegment { mut segment, id }: OpenSegment,
                  start_index: u64)
                  -> Result<ClosedSegment> {
@@ -249,6 +262,7 @@ mod test {
     use std::error::Error;
 
     use eventual::{Async, Future, Join};
+    use fs2;
     use test::quickcheck::TestResult;
 
     use super::Wal;
@@ -328,16 +342,13 @@ mod test {
 
     /// Tests that two Wal instances can not coexist for the same directory.
     #[test]
-    fn test_exclusive_lock2() {
+    fn test_exclusive_lock() {
         let _ = env_logger::init();
         let dir = tempdir::TempDir::new("wal").unwrap();
-        let mut wal = Wal::open(&dir.path()).unwrap();
-        let entry: &[u8] = &b"foo"[..];
-        wal.append(&entry).await().unwrap();
-
-        let wal2 = Wal::open(&dir.path());
-        assert!(wal2.is_err() || wal2.unwrap().entry(0).is_some());
+        let wal = Wal::open(&dir.path()).unwrap();
+        assert_eq!(fs2::lock_contended_error().kind(),
+                   Wal::open(&dir.path()).unwrap_err().kind());
         drop(wal);
-        assert!(Wal::open(&dir.path()).unwrap().entry(0).is_some());
+        assert!(Wal::open(&dir.path()).is_ok());
     }
 }

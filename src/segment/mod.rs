@@ -3,7 +3,7 @@ pub mod creator;
 pub mod flusher;
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{
     Error,
     ErrorKind,
@@ -16,7 +16,6 @@ use std::ptr;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
-use fs2::FileExt;
 use memmap::{Mmap, Protection};
 use rand;
 use mmap::MmapHandle;
@@ -81,8 +80,6 @@ type Crc = u32;
 pub struct Segment {
     /// The segment file buffer.
     mmap: MmapHandle,
-    /// The open segment file.
-    file: File,
     /// The segment file path.
     path: PathBuf,
     /// Index of entry offset and lengths.
@@ -101,7 +98,7 @@ impl Segment {
     /// If a segment or another file already exists on the path it will be
     /// overwritten, and the allocated file space will be reused.
     ///
-    /// An individual file may only be opened by a single segment at a time.
+    /// An individual file should only be opened by a single segment at a time.
     ///
     /// The caller is responsible for syncing the directory in order to
     /// guarantee that the segment is durable in the event of a crash.
@@ -115,7 +112,6 @@ impl Segment {
                                     .write(true)
                                     .create(true)
                                     .open(&path));
-        try!(file.try_lock_exclusive());
         try!(file.set_len(capacity as u64));
 
         let mut mmap = try!(Mmap::open_with_offset(&file,
@@ -132,7 +128,6 @@ impl Segment {
         try!(file.sync_all());
         Ok(Segment {
             mmap: MmapHandle::new(mmap),
-            file: file,
             path: path.as_ref().to_path_buf(),
             index: Vec::new(),
             crc: seed,
@@ -142,13 +137,6 @@ impl Segment {
     /// Opens the segment at the specified path.
     pub fn open<P>(path: P) -> Result<Segment> where P: AsRef<Path> {
         let mmap = try!(Mmap::open_path(&path, Protection::ReadWrite));
-        let file = try!(OpenOptions::new()
-                                    .read(true)
-                                    .write(true)
-                                    .create(false)
-                                    .open(&path));
-        try!(file.try_lock_exclusive());
-
         let mut index = Vec::new();
         let mut crc;
         {
@@ -180,7 +168,6 @@ impl Segment {
 
         Ok(Segment {
             mmap: MmapHandle::new(mmap),
-            file: file,
             path: path.as_ref().to_path_buf(),
             index: index,
             crc: crc,
@@ -333,7 +320,7 @@ mod test {
 
     use std::io::ErrorKind;
 
-    use super::{HEADER_LEN, Segment, padding};
+    use super::{Segment, padding};
 
     #[test]
     fn test_pad_len() {
@@ -368,18 +355,6 @@ mod test {
         let _ = env_logger::init();
         let dir = tempdir::TempDir::new("segment").unwrap();
         assert!(Segment::open(dir.path()).is_err());
-    }
-
-    /// Opening multiple segments on the same file should fail.
-    #[test]
-    fn test_exclusive() {
-        let _ = env_logger::init();
-        let dir = tempdir::TempDir::new("segment").unwrap();
-        let mut path = dir.path().to_path_buf();
-        path.push("test-exclusive");
-        let segment = Segment::create(&path, 4096).unwrap();
-        assert_eq!(ErrorKind::WouldBlock, Segment::open(&path).unwrap_err().kind());
-        assert_eq!(ErrorKind::WouldBlock, Segment::create(&path, 4096).unwrap_err().kind());
     }
 
     #[test]
