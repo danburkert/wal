@@ -13,12 +13,16 @@ use std::io::{
 use std::ops;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
 use memmap::{Mmap, Protection};
-use rand;
 use mmap::MmapHandle;
+use rand;
+use time::PreciseTime;
+use eventual::{Complete, Future};
 
 /// The magic bytes and version tag of the segment header.
 const SEGMENT_HEADER: &'static [u8; 4] = b"wal\0";
@@ -86,6 +90,8 @@ pub struct Segment {
     index: Vec<(usize, usize)>,
     /// The crc of the last appended entry.
     crc: Crc,
+    /// Sync channel.
+    sync_chan: Sender<(Complete<(), Error>, usize, usize)>,
 }
 
 impl Segment {
@@ -114,29 +120,34 @@ impl Segment {
                                     .open(&path));
         try!(file.set_len(capacity as u64));
 
-        let mut mmap = try!(Mmap::open_with_offset(&file,
-                                                   Protection::ReadWrite,
-                                                   0,
-                                                   capacity));
-
+        let mut mmap = MmapHandle::new(try!(Mmap::open_with_offset(&file,
+                                                                   Protection::ReadWrite,
+                                                                   0,
+                                                                   capacity)));
         let seed = rand::random();
 
         // Write and sync the header information.
-        copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut_slice()[..4] });
-        LittleEndian::write_u32(unsafe { &mut mmap.as_mut_slice()[4..] }, seed);
+        copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut().as_mut_slice()[..4] });
+        LittleEndian::write_u32(unsafe { &mut mmap.as_mut().as_mut_slice()[4..] }, seed);
+
+        // Create the sync thread.
+        let (tx, rx) = channel();
+        let sync_mmap = mmap.clone();
+        thread::spawn(move || sync_loop(sync_mmap, rx));
 
         try!(file.sync_all());
         Ok(Segment {
-            mmap: MmapHandle::new(mmap),
+            mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: Vec::new(),
             crc: seed,
+            sync_chan: tx,
         })
     }
 
     /// Opens the segment at the specified path.
     pub fn open<P>(path: P) -> Result<Segment> where P: AsRef<Path> {
-        let mmap = try!(Mmap::open_path(&path, Protection::ReadWrite));
+        let mmap = MmapHandle::new(try!(Mmap::open_path(&path, Protection::ReadWrite)));
         let mut index = Vec::new();
         let mut crc;
         {
@@ -145,7 +156,7 @@ impl Segment {
             //
             // If the CRC of any entry does not match, then parsing stops and
             // the remainder of the file is considered empty.
-            let segment = unsafe { mmap.as_slice() };
+            let segment = unsafe { mmap.as_ref().as_slice() };
             crc = LittleEndian::read_u32(&segment[SEGMENT_HEADER.len()..]);
             let mut offset = HEADER_LEN;
 
@@ -166,11 +177,17 @@ impl Segment {
             }
         }
 
+        // Create the sync thread.
+        let (tx, rx) = channel();
+        let sync_mmap = mmap.clone();
+        thread::spawn(move || sync_loop(sync_mmap, rx));
+
         Ok(Segment {
-            mmap: MmapHandle::new(mmap),
+            mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: index,
             crc: crc,
+            sync_chan: tx,
         })
     }
 
@@ -268,7 +285,7 @@ impl Segment {
         self.index.len()
     }
 
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn sync(&mut self) -> Result<()> {
         self.mmap.as_mut().flush()
     }
 
@@ -311,6 +328,53 @@ pub fn copy_memory(src: &[u8], dst: &mut [u8]) {
 /// Returns the number of padding bytes to add to a buffer to ensure 8-byte alignment.
 fn padding(len: usize) -> usize {
     4usize.wrapping_sub(len) & 7
+}
+
+fn sync_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, usize)>) {
+    fn sync(offset: usize,
+            len: usize,
+            mmap: &mut MmapHandle,
+            completions: &mut Vec<Complete<(), Error>>) {
+        let start = PreciseTime::now();
+        let result = mmap.as_mut().flush_range(offset, len);
+        trace!("synced {} entries in range [{}, {}) in {}μs",
+                completions.len(), offset, offset + len,
+                start.to(PreciseTime::now()).num_microseconds().unwrap());
+        match result {
+            Ok(_) => {
+                for complete in completions.drain(..) {
+                    complete.complete(())
+                }
+            }
+            Err(error) => {
+                warn!("error while syncing segment: {:?}", error);
+                for complete in completions.drain(..) {
+                    complete.fail(Error::new(error.kind(), "segment sync error"));
+                }
+            }
+        }
+    }
+
+    let mut completions: Vec<Complete<(), Error>> = Vec::new();
+    while let Ok((completion, mut offset, mut len)) = rx.recv() {
+        completions.push(completion);
+        while let Ok((completion, new_offset, new_len)) = rx.try_recv() {
+            if offset + len == new_offset {
+                // The next flush range is contiguous with the previous;
+                // continue looping.
+                completions.push(completion);
+                len += new_len;
+            } else {
+                // The new flush range is not contiguous; flush what is already
+                // buffered, reset the offset and len, and continue looping.
+                sync(offset, len, &mut mmap, &mut completions);
+                offset = new_offset;
+                len = new_len;
+            }
+        }
+        sync(offset, len, &mut mmap, &mut completions);
+    }
+    info!("shutting down");
 }
 
 #[cfg(test)]

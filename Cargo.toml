@@ -11,6 +11,7 @@ fs2 = "*"
 log = "*"
 memmap = "*"
 rand = "*"
+time = "*"
 
 [dev-dependencies]
 docopt = "*"

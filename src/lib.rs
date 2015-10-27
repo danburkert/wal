@@ -8,6 +8,7 @@ extern crate eventual;
 extern crate fs2;
 extern crate memmap;
 extern crate rand;
+extern crate time;
 #[macro_use]
 extern crate log;
 
@@ -15,15 +16,16 @@ mod mmap;
 mod segment;
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::ops;
 use std::path::Path;
 use std::str::FromStr;
-use std::fmt;
+use std::thread;
 
-use eventual::Future;
+use eventual::{Complete, Future};
 use fs2::FileExt;
 
 use segment::creator::SegmentCreator;
