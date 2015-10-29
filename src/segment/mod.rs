@@ -1,6 +1,5 @@
 
 pub mod creator;
-pub mod flusher;
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -146,17 +145,17 @@ pub struct SyncSegment {
 
 impl SyncSegment {
 
-    /// Creates a new log segment at the specified path with the provided
+    /// Creates a new segment file at the specified path with the provided
     /// initial capacity.
     ///
     /// The initial capacity must be at least 8 bytes.
     ///
-    /// If a segment or another file already exists on the path it will be
-    /// overwritten, and the allocated file space will be reused.
+    /// If a file already exists at the path it will be overwritten, and the
+    /// allocated space will be reused.
     ///
     /// An individual file should only be opened by a single segment at a time.
     ///
-    /// The caller is responsible for syncing the directory in order to
+    /// The caller is responsible for flushing the directory in order to
     /// guarantee that the segment is durable in the event of a crash.
     pub fn create<P>(path: P, capacity: usize) -> Result<SyncSegment> where P: AsRef<Path> {
         if capacity < HEADER_LEN {
@@ -176,12 +175,9 @@ impl SyncSegment {
                                                                    capacity)));
         let seed = rand::random();
 
-        // Write and sync the header information.
+        // Write and flush the header information.
         copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut().as_mut_slice()[..4] });
         LittleEndian::write_u32(unsafe { &mut mmap.as_mut().as_mut_slice()[4..] }, seed);
-
-        // TODO: is this necessary?
-        try!(file.sync_all());
 
         Ok(SyncSegment {
             mmap: mmap,
@@ -192,7 +188,9 @@ impl SyncSegment {
         })
     }
 
-    /// Opens the segment at the specified path.
+    /// Opens the segment file at the specified path.
+    ///
+    /// An individual file should only be opened by one segment at a time.
     pub fn open<P>(path: P) -> Result<SyncSegment> where P: AsRef<Path> {
         let mmap = MmapHandle::new(try!(Mmap::open_path(&path, Protection::ReadWrite)));
         let mut index = Vec::new();
@@ -243,6 +241,14 @@ impl SyncSegment {
 
     pub fn mmap(&self) -> MmapHandle {
         self.mmap.clone()
+    }
+
+    fn flush_offset(&self) -> usize {
+        self.flush_offset
+    }
+
+    fn set_flush_offset(&mut self, offset: usize) {
+        self.flush_offset = offset;
     }
 }
 
@@ -320,7 +326,16 @@ impl Segment for SyncSegment {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.mmap.as_mut().flush()
+        let start = self.flush_offset;
+        let end = self.size();
+        assert!(start <= end);
+
+        if start == end {
+            Ok(())
+        } else {
+            self.flush_offset = end;
+            self.mmap.as_mut().flush_range(start, end)
+        }
     }
 
     fn path(&self) -> &Path {
@@ -331,6 +346,107 @@ impl Segment for SyncSegment {
 impl fmt::Debug for SyncSegment {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SyncSegment {{ path: {:?}, entry_count: {} }}", &self.path, self.index.len())
+    }
+}
+
+pub struct AsyncSegment {
+    segment: SyncSegment,
+    flush_chan: Sender<(Complete<(), Error>, usize, usize)>,
+}
+
+impl AsyncSegment {
+
+    /// Creates a new segment file. See `SyncSegment::create` for details.
+    pub fn create<P>(path: P, capacity: usize) -> Result<AsyncSegment> where P: AsRef<Path> {
+        let segment = try!(SyncSegment::create(path, capacity));
+
+        // Create the flush thread.
+        let (tx, rx) = channel();
+        let flush_mmap = segment.mmap();
+        thread::spawn(move || flush_loop(flush_mmap, rx));
+
+        Ok(AsyncSegment {
+            segment: segment,
+            flush_chan: tx,
+        })
+    }
+
+    /// Opens the segment at the specified path.
+    pub fn open<P>(path: P) -> Result<AsyncSegment> where P: AsRef<Path> {
+        let segment = try!(SyncSegment::open(path));
+
+        // Create the flush thread.
+        let (tx, rx) = channel();
+        let flush_mmap = segment.mmap();
+        thread::spawn(move || flush_loop(flush_mmap, rx));
+
+        Ok(AsyncSegment {
+            segment: segment,
+            flush_chan: tx,
+        })
+    }
+
+    /// Turns this async segment into a synchronous segment.
+    ///
+    /// The segment is not flushed, and this is not a blocking call.
+    pub fn into_sync_segment(self) -> SyncSegment {
+        self.segment
+    }
+}
+
+impl Segment for AsyncSegment {
+    type FlushResult = Future<(), Error>;
+
+    fn entry(&self, index: usize) -> Option<&[u8]> {
+        self.segment.entry(index)
+    }
+
+    fn append<T>(&mut self, entry: &T) -> Option<usize> where T: ops::Deref<Target=[u8]> {
+        self.segment.append(entry)
+    }
+
+    fn len(&self) -> usize {
+        self.segment.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.segment.capacity()
+    }
+
+    fn size(&self) -> usize {
+        self.segment.size()
+    }
+
+    fn remaining_size(&self) -> usize {
+        self.segment.remaining_size()
+    }
+
+    fn rename<P>(&mut self, path: P) -> Result<()> where P: AsRef<Path> {
+        self.segment.rename(path)
+    }
+
+    fn delete(self) -> Result<()> {
+        self.segment.delete()
+    }
+
+    fn flush(&mut self) -> Future<(), Error> {
+        let start = self.segment.flush_offset();
+        let end = self.segment.size();
+        assert!(start <= end);
+
+        if start == end {
+            Future::of(())
+        } else {
+            self.segment.set_flush_offset(end);
+            let (complete, future) = Future::pair();
+            // The flush channel does not close until the segment is dropped.
+            self.flush_chan.send((complete, start, end)).unwrap();
+            future
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.segment.path()
     }
 }
 
@@ -352,15 +468,15 @@ fn padding(len: usize) -> usize {
     4usize.wrapping_sub(len) & 7
 }
 
-fn sync_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, usize)>) {
-    fn sync(offset: usize,
-            len: usize,
-            mmap: &mut MmapHandle,
-            completions: &mut Vec<Complete<(), Error>>) {
+fn flush_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, usize)>) {
+    fn flush(offset: usize,
+             len: usize,
+             mmap: &mut MmapHandle,
+             completions: &mut Vec<Complete<(), Error>>) {
         let start = PreciseTime::now();
         let result = mmap.as_mut().flush_range(offset, len);
-        trace!("synced {} entries in range [{}, {}) in {}μs",
-                completions.len(), offset, offset + len,
+        trace!("flushed {} bytes from offset {} in {}μs",
+                len, offset,
                 start.to(PreciseTime::now()).num_microseconds().unwrap());
         match result {
             Ok(_) => {
@@ -389,12 +505,12 @@ fn sync_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, usi
             } else {
                 // The new flush range is not contiguous; flush what is already
                 // buffered, reset the offset and len, and continue looping.
-                sync(offset, len, &mut mmap, &mut completions);
+                flush(offset, len, &mut mmap, &mut completions);
                 offset = new_offset;
                 len = new_len;
             }
         }
-        sync(offset, len, &mut mmap, &mut completions);
+        flush(offset, len, &mut mmap, &mut completions);
     }
     info!("shutting down");
 }

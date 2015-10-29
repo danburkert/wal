@@ -23,14 +23,12 @@ use std::mem;
 use std::ops;
 use std::path::Path;
 use std::str::FromStr;
-use std::thread;
 
-use eventual::{Complete, Future};
+use eventual::Future;
 use fs2::FileExt;
 
 use segment::creator::SegmentCreator;
-use segment::flusher::SegmentFlusher;
-pub use segment::{Segment, SyncSegment};
+pub use segment::{AsyncSegment, Segment, SyncSegment};
 
 #[derive(Debug)]
 pub struct WalOptions {
@@ -56,7 +54,7 @@ impl Default for WalOptions {
 /// TODO: this shouldn't be public
 pub struct OpenSegment {
     pub id: u64,
-    pub segment: SyncSegment,
+    pub segment: AsyncSegment,
 }
 
 /// A closed segment, and the associated start and stop indices.
@@ -72,10 +70,13 @@ enum WalSegment {
 }
 
 pub struct Wal {
+    /// The segment currently being appended to.
     open_segment: OpenSegment,
     closed_segments: Vec<ClosedSegment>,
     creator: SegmentCreator,
-    flusher: SegmentFlusher,
+    /// The directory containing the write ahead log. Used to hold an open file
+    /// lock for the lifetime of the log.
+    #[allow(dead_code)]
     dir: File,
 }
 
@@ -159,13 +160,10 @@ impl Wal {
             None => try!(creator.next()),
         };
 
-        let flusher = SegmentFlusher::new(open_segment.segment.mmap());
-
         Ok(Wal {
             open_segment: open_segment,
             closed_segments: closed_segments,
             creator: creator,
-            flusher: flusher,
             dir: dir,
         })
     }
@@ -176,7 +174,6 @@ impl Wal {
         mem::swap(&mut self.open_segment, &mut segment);
         let len = self.closed_segments.len();
         let start_index = if len > 0 { self.closed_segments[len - 1].end_index + 1 } else { 0 };
-        try!(self.flusher.reset(segment.segment.mmap()));
         self.closed_segments.push(try!(close_segment(segment, start_index)));
         Ok(())
     }
@@ -188,9 +185,9 @@ impl Wal {
             }
         }
 
-        // TODO: figure out a real answer for entries bigger the segment size.
+        // TODO: figure out a solution for entries bigger than the segment size.
         self.open_segment.segment.append(entry).unwrap();
-        self.flusher.flush()
+        self.open_segment.segment.flush()
     }
 
     pub fn entry(&self, index: u64) -> Option<&[u8]> {
@@ -246,7 +243,7 @@ fn close_segment(OpenSegment { mut segment, id }: OpenSegment,
     debug!("closing open segment {} with entries {} through {}", id, start_index, end_index);
     Ok(ClosedSegment { start_index: start_index,
                        end_index: end_index,
-                       segment: segment })
+                       segment: segment.into_sync_segment() })
 }
 
 fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
@@ -265,7 +262,7 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
     match &*filename.split('-').collect::<Vec<&str>>() {
         ["open", id] => {
             let id = try!(u64::from_str(id).map_err(|_| error()));
-            let segment = try!(SyncSegment::open(entry.path()));
+            let segment = try!(AsyncSegment::open(entry.path()));
             Ok(WalSegment::Open(OpenSegment { segment: segment, id: id }))
         },
         ["closed", start, end] => {
