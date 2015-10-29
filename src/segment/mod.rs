@@ -35,7 +35,7 @@ const CRC_LEN: usize = 4;
 
 type Crc = u32;
 
-/// An append-only, fixed-length, durable log of entries.
+/// An append-only, fixed-length, durable, on-disk container of entries.
 ///
 /// The segment on-disk format is as simple as possible, while providing
 /// backwards compatibility, protection against corruption, and alignment
@@ -62,10 +62,10 @@ type Crc = u32;
 /// | random CRC seed        | u32     |
 ///
 /// The segment header is 8 bytes long: three magic bytes ("wal") followed by a
-/// segment format version u8, followed by a random u32 CRC seed. The CRC seed
-/// is serialized in little-endian format. The CRC seed ensures that if a
-/// segment file is overwritten with a new segment, the old entries will be
-/// ignored (since the CRC will not match).
+/// segment format version `u8`, followed by a random `u32` CRC seed. The CRC
+/// seed is serialized in little-endian format. The CRC seed ensures that if a
+/// segment file is reused for a new segment, the old entries will be ignored
+/// (since the CRC will not match).
 ///
 /// ### Entry Format
 ///
@@ -81,7 +81,57 @@ type Crc = u32;
 /// the length of the data as a u64 in little-endian format. The footer includes
 /// between 0 and 7 bytes of padding to extend the total length of the entry to
 /// a multiple of 8, followed by the CRC code of the length, data, and padding.
-pub struct Segment {
+pub trait Segment {
+
+    type FlushResult;
+
+    /// Returns the segment entry at the specified index, or `None` if no such
+    /// entry exists.
+    fn entry(&self, index: usize) -> Option<&[u8]>;
+
+    /// Appends an entry to the segment, returning the index of the new entry,
+    /// or `None` if there is insufficient space for the entry.
+    ///
+    /// The entry may be immediately read from the log, but it is not guaranteed
+    /// to be durably stored on disk until the segment is successfully flushed.
+    fn append<T>(&mut self, entry: &T) -> Option<usize> where T: ops::Deref<Target=[u8]>;
+
+    /// Flushes recently written entries to durable storage.
+    fn flush(&mut self) -> Self::FlushResult;
+
+    /// Returns the number of entries in the segment.
+    fn len(&self) -> usize;
+
+    /// Returns the capacity of the segment in bytes.
+    ///
+    /// Each entry is stored with a header and padding, so the entire capacity
+    /// will not be available for entry data.
+    fn capacity(&self) -> usize;
+
+    /// Returns the total number of bytes used to store existing entries,
+    /// including header and padding overhead.
+    fn size(&self) -> usize;
+
+    /// Returns the number of bytes available for the next segment.
+    ///
+    /// This method can be used to make sure that an entry can be appended to
+    /// the segment without allocating additional file space.
+    fn remaining_size(&self) -> usize;
+
+    /// Returns the path to the segment file.
+    fn path(&self) -> &Path;
+
+    /// Renames the segment file.
+    ///
+    /// The caller is responsible for syncing the directory in order to
+    /// guarantee that the rename is durable in the event of a crash.
+    fn rename<P>(&mut self, path: P) -> Result<()> where P: AsRef<Path>;
+
+    /// Deletes the segment file.
+    fn delete(self) -> Result<()>;
+}
+
+pub struct SyncSegment {
     /// The segment file buffer.
     mmap: MmapHandle,
     /// The segment file path.
@@ -90,11 +140,11 @@ pub struct Segment {
     index: Vec<(usize, usize)>,
     /// The crc of the last appended entry.
     crc: Crc,
-    /// Sync channel.
-    sync_chan: Sender<(Complete<(), Error>, usize, usize)>,
+    /// Offset of last flush.
+    flush_offset: usize,
 }
 
-impl Segment {
+impl SyncSegment {
 
     /// Creates a new log segment at the specified path with the provided
     /// initial capacity.
@@ -108,7 +158,7 @@ impl Segment {
     ///
     /// The caller is responsible for syncing the directory in order to
     /// guarantee that the segment is durable in the event of a crash.
-    pub fn create<P>(path: P, capacity: usize) -> Result<Segment> where P: AsRef<Path> {
+    pub fn create<P>(path: P, capacity: usize) -> Result<SyncSegment> where P: AsRef<Path> {
         if capacity < HEADER_LEN {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid segment capacity"));
         }
@@ -130,23 +180,20 @@ impl Segment {
         copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut().as_mut_slice()[..4] });
         LittleEndian::write_u32(unsafe { &mut mmap.as_mut().as_mut_slice()[4..] }, seed);
 
-        // Create the sync thread.
-        let (tx, rx) = channel();
-        let sync_mmap = mmap.clone();
-        thread::spawn(move || sync_loop(sync_mmap, rx));
-
+        // TODO: is this necessary?
         try!(file.sync_all());
-        Ok(Segment {
+
+        Ok(SyncSegment {
             mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: Vec::new(),
             crc: seed,
-            sync_chan: tx,
+            flush_offset: 0,
         })
     }
 
     /// Opens the segment at the specified path.
-    pub fn open<P>(path: P) -> Result<Segment> where P: AsRef<Path> {
+    pub fn open<P>(path: P) -> Result<SyncSegment> where P: AsRef<Path> {
         let mmap = MmapHandle::new(try!(Mmap::open_path(&path, Protection::ReadWrite)));
         let mut index = Vec::new();
         let mut crc;
@@ -177,28 +224,39 @@ impl Segment {
             }
         }
 
-        // Create the sync thread.
-        let (tx, rx) = channel();
-        let sync_mmap = mmap.clone();
-        thread::spawn(move || sync_loop(sync_mmap, rx));
-
-        Ok(Segment {
+        Ok(SyncSegment {
             mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: index,
             crc: crc,
-            sync_chan: tx,
+            flush_offset: 0,
         })
     }
 
-    /// Appends an entry to the segment, returning `None` if there is
-    /// insufficient space in the log for the entry, or the index of the new
-    /// entry.
-    ///
-    /// The entry may be immediately read from the log, but it is not guaranteed
-    /// to be durably stored on disk until the segment is successfully flushed.
-    pub fn append<T>(&mut self, entry: &T) -> Option<usize>
-    where T: ops::Deref<Target=[u8]> {
+    fn as_slice(&self) -> &[u8] {
+        unsafe { self.mmap.as_ref().as_slice() }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { self.mmap.as_mut().as_mut_slice() }
+    }
+
+    pub fn mmap(&self) -> MmapHandle {
+        self.mmap.clone()
+    }
+}
+
+impl Segment for SyncSegment {
+
+    type FlushResult = Result<()>;
+
+    fn entry(&self, index: usize) -> Option<&[u8]> {
+        self.index
+            .get(index)
+            .map(|&(offset, len)| &self.as_slice()[offset..offset + len])
+    }
+
+    fn append<T>(&mut self, entry: &T) -> Option<usize> where T: ops::Deref<Target=[u8]> {
         if entry.len() > self.remaining_size() {
             return None;
         }
@@ -230,85 +288,49 @@ impl Segment {
         Some(self.index.len() - 1)
     }
 
-    /// Returns the segment entry at the specified index, or `None` if no such
-    /// entry exists.
-    pub fn entry(&self, index: usize) -> Option<&[u8]> {
-        self.index
-            .get(index)
-            .map(|&(offset, len)| &self.as_slice()[offset..offset + len])
+    fn len(&self) -> usize {
+        self.index.len()
     }
 
-    /// Returns the capacity of the segment in bytes.
-    ///
-    /// Each entry is stored with a header and padding, so the entire capacity
-    /// will not be available for entry data.
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.mmap.as_ref().len()
     }
 
-    /// Returns the total number of bytes used to store the entries, including
-    /// header and padding overhead.
-    pub fn size(&self) -> usize {
+    fn size(&self) -> usize {
         self.index
             .last()
             .map(|&(offset, len)| offset + len + padding(len) + CRC_LEN )
             .unwrap_or(HEADER_LEN)
     }
 
-    /// Returns the number of bytes available for the next segment.
-    ///
-    /// This method can be used to make sure that an entry can be appended to
-    /// the segment without allocating additional file space.
-    pub fn remaining_size(&self) -> usize {
+    fn remaining_size(&self) -> usize {
         let unpadded = self.capacity() - self.size() - HEADER_LEN - CRC_LEN;
         // Round down to a multiple of eight, since padding would otherwise be required.
         unpadded & !7
     }
 
-    pub fn delete(self) -> Result<()> {
-        let Segment { path, .. } = self;
-        fs::remove_file(path)
-    }
-
-    /// Renames the segment.
-    ///
-    /// The caller is responsible for syncing the directory in order to
-    /// guarantee that the rename is durable in the event of a crash.
-    pub fn rename<P>(&mut self, path: P) -> Result<()> where P: AsRef<Path> {
+    fn rename<P>(&mut self, path: P) -> Result<()> where P: AsRef<Path> {
         try!(fs::rename(&self.path, &path));
         self.path = path.as_ref().to_path_buf();
         Ok(())
     }
 
-    /// Returns the number of entries in the segment.
-    pub fn len(&self) -> usize {
-        self.index.len()
+    fn delete(self) -> Result<()> {
+        fs::remove_file(&self.path)
     }
 
-    pub fn sync(&mut self) -> Result<()> {
+    fn flush(&mut self) -> Result<()> {
         self.mmap.as_mut().flush()
     }
 
-    fn as_slice(&self) -> &[u8] {
-        unsafe { self.mmap.as_ref().as_slice() }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { self.mmap.as_mut().as_mut_slice() }
-    }
-
-    pub fn path(&self) -> &Path {
+    fn path(&self) -> &Path {
         &self.path
-    }
-
-    pub fn mmap(&self) -> MmapHandle {
-        self.mmap.clone()
     }
 }
 
-impl fmt::Debug for Segment {
+impl fmt::Debug for SyncSegment {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Segment {{ path: {:?}, entry_count: {} }}", &self.path, self.index.len())
+        write!(f, "SyncSegment {{ path: {:?}, entry_count: {} }}", &self.path, self.index.len())
     }
 }
 
@@ -347,9 +369,9 @@ fn sync_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, usi
                 }
             }
             Err(error) => {
-                warn!("error while syncing segment: {:?}", error);
+                warn!("error while flushing async segment: {:?}", error);
                 for complete in completions.drain(..) {
-                    complete.fail(Error::new(error.kind(), "segment sync error"));
+                    complete.fail(Error::new(error.kind(), "async flush error"));
                 }
             }
         }
@@ -384,7 +406,7 @@ mod test {
 
     use std::io::ErrorKind;
 
-    use super::{Segment, padding};
+    use super::{Segment, SyncSegment, padding};
 
     #[test]
     fn test_pad_len() {
@@ -407,18 +429,18 @@ mod test {
         assert_eq!(5, padding(15));
     }
 
-    fn test_segment(len: usize) -> Segment {
+    fn test_segment(len: usize) -> SyncSegment {
         let dir = tempdir::TempDir::new("segment").unwrap();
         let mut path = dir.path().to_path_buf();
         path.push("test-segment");
-        Segment::create(path, len).unwrap()
+        SyncSegment::create(path, len).unwrap()
     }
 
     #[test]
     fn test_create_dir_path() {
         let _ = env_logger::init();
         let dir = tempdir::TempDir::new("segment").unwrap();
-        assert!(Segment::open(dir.path()).is_err());
+        assert!(SyncSegment::open(dir.path()).is_err());
     }
 
     #[test]
@@ -466,7 +488,7 @@ mod test {
                                   b"0123456789"];
 
         {
-            let mut segment = Segment::create(&path, 4096).unwrap();
+            let mut segment = SyncSegment::create(&path, 4096).unwrap();
             for (i, entry) in entries.iter().enumerate() {
                 let index = segment.append(entry).unwrap();
                 assert_eq!(i, index);
@@ -474,7 +496,7 @@ mod test {
             segment.flush().unwrap();
         }
 
-        let segment = Segment::open(&path).unwrap();
+        let segment = SyncSegment::open(&path).unwrap();
         assert_eq!(4096, segment.capacity());
         assert_eq!(entries.len(), segment.len());
 
@@ -497,15 +519,15 @@ mod test {
                                   b"abcdefgh"];
 
         {
-            let mut segment = Segment::create(&path, 4096).unwrap();
+            let mut segment = SyncSegment::create(&path, 4096).unwrap();
             for (i, entry) in entries.iter().enumerate() {
                 let index = segment.append(entry).unwrap();
                 assert_eq!(i, index);
             }
         }
 
-        Segment::create(&path, 4096).unwrap();
-        let segment = Segment::open(&path).unwrap();
+        SyncSegment::create(&path, 4096).unwrap();
+        let segment = SyncSegment::open(&path).unwrap();
 
         assert_eq!(0, segment.len());
     }
@@ -517,6 +539,6 @@ mod test {
         let dir = tempdir::TempDir::new("segment").unwrap();
         let mut path = dir.path().to_path_buf();
         path.push("test-open-nonexistent");
-        assert_eq!(ErrorKind::NotFound, Segment::open(&path).unwrap_err().kind());
+        assert_eq!(ErrorKind::NotFound, SyncSegment::open(&path).unwrap_err().kind());
     }
 }

@@ -1,9 +1,9 @@
 extern crate wal;
 
-use wal::Segment;
+use wal::SyncSegment;
 use std::mem;
 
 
 fn main() {
-    mem::forget(Segment::create("test", 4096).unwrap());
+    mem::forget(SyncSegment::create("test", 4096).unwrap());
 }

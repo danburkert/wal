@@ -30,7 +30,7 @@ use fs2::FileExt;
 
 use segment::creator::SegmentCreator;
 use segment::flusher::SegmentFlusher;
-pub use segment::Segment;
+pub use segment::{Segment, SyncSegment};
 
 #[derive(Debug)]
 pub struct WalOptions {
@@ -56,14 +56,14 @@ impl Default for WalOptions {
 /// TODO: this shouldn't be public
 pub struct OpenSegment {
     pub id: u64,
-    pub segment: Segment,
+    pub segment: SyncSegment,
 }
 
 /// A closed segment, and the associated start and stop indices.
 struct ClosedSegment {
     pub start_index: u64,
     pub end_index: u64,
-    pub segment: Segment,
+    pub segment: SyncSegment,
 }
 
 enum WalSegment {
@@ -265,13 +265,13 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
     match &*filename.split('-').collect::<Vec<&str>>() {
         ["open", id] => {
             let id = try!(u64::from_str(id).map_err(|_| error()));
-            let segment = try!(Segment::open(entry.path()));
+            let segment = try!(SyncSegment::open(entry.path()));
             Ok(WalSegment::Open(OpenSegment { segment: segment, id: id }))
         },
         ["closed", start, end] => {
             let start = try!(u64::from_str(start).map_err(|_| error()));
             let end = try!(u64::from_str(end).map_err(|_| error()));
-            let segment = try!(Segment::open(entry.path()));
+            let segment = try!(SyncSegment::open(entry.path()));
             Ok(WalSegment::Closed(ClosedSegment { start_index: start,
                                                   end_index: end,
                                                   segment: segment }))

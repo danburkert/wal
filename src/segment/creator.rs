@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
-use segment::Segment;
+use segment::{Segment, SyncSegment};
 use OpenSegment;
 
 pub struct SegmentCreator {
@@ -79,7 +79,7 @@ fn create_loop(tx: SyncSender<OpenSegment>,
 
     while cont {
         path.push(format!("open-{}", id));
-        let segment = OpenSegment { id: id, segment: try!(Segment::create(&path, capacity)) };
+        let segment = OpenSegment { id: id, segment: try!(SyncSegment::create(&path, capacity)) };
         path.pop();
         id += 1;
         // Sync the directory, guaranteeing that the segment file is durably
