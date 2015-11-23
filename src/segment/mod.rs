@@ -1,4 +1,3 @@
-
 pub mod creator;
 
 use std::fmt;
@@ -95,6 +94,12 @@ pub trait Segment {
     /// to be durably stored on disk until the segment is successfully flushed.
     fn append<T>(&mut self, entry: &T) -> Option<usize> where T: ops::Deref<Target=[u8]>;
 
+    /// Truncates the entries in the segment beginning with `from`.
+    ///
+    /// The entries are not guaranteed to be removed until the segment is
+    /// successfully flushed.
+    fn truncate(&mut self, from: usize);
+
     /// Flushes recently written entries to durable storage.
     fn flush(&mut self) -> Self::FlushResult;
 
@@ -117,6 +122,10 @@ pub trait Segment {
     /// the segment without allocating additional file space.
     fn remaining_size(&self) -> usize;
 
+    /// Shrinks the file backing this segment to the minimum size necessary to
+    /// hold the current entries.
+    fn shrink_to_fit(&mut self) -> Result<()>;
+
     /// Returns the path to the segment file.
     fn path(&self) -> &Path;
 
@@ -137,6 +146,8 @@ pub struct SyncSegment {
     path: PathBuf,
     /// Index of entry offset and lengths.
     index: Vec<(usize, usize)>,
+    /// The capacity of the segment in bytes.
+    capacity: usize,
     /// The crc of the last appended entry.
     crc: Crc,
     /// Offset of last flush.
@@ -158,6 +169,7 @@ impl SyncSegment {
     /// The caller is responsible for flushing the directory in order to
     /// guarantee that the segment is durable in the event of a crash.
     pub fn create<P>(path: P, capacity: usize) -> Result<SyncSegment> where P: AsRef<Path> {
+        // TODO: roll capacity up to nearest disk allocation granularity.
         if capacity < HEADER_LEN {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid segment capacity"));
         }
@@ -183,6 +195,7 @@ impl SyncSegment {
             mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: Vec::new(),
+            capacity: capacity,
             crc: seed,
             flush_offset: 0,
         })
@@ -222,10 +235,13 @@ impl SyncSegment {
             }
         }
 
+        let capacity = mmap.as_ref().len();
+
         Ok(SyncSegment {
             mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: index,
+            capacity: capacity,
             crc: crc,
             flush_offset: 0,
         })
@@ -274,8 +290,7 @@ impl Segment for SyncSegment {
 
         let mut crc = self.crc;
 
-        LittleEndian::write_u64(&mut self.as_mut_slice()[offset..],
-                                entry.len() as u64);
+        LittleEndian::write_u64(&mut self.as_mut_slice()[offset..], entry.len() as u64);
         copy_memory(entry, &mut self.as_mut_slice()[offset + HEADER_LEN..]);
 
         if padding > 0 {
@@ -294,12 +309,24 @@ impl Segment for SyncSegment {
         Some(self.index.len() - 1)
     }
 
+    fn truncate(&mut self, from: usize) {
+        if from >= self.index.len() { return; }
+
+        // Remove the index entries.
+        let _ = self.index.drain(from..);
+
+        // And overwrite the existing data so that we will not read the data back after a crash.
+        let size = self.size();
+        let zeroes: [u8; 16] = [0; 16];
+        copy_memory(&zeroes, &mut self.as_mut_slice()[size..]);
+    }
+
     fn len(&self) -> usize {
         self.index.len()
     }
 
     fn capacity(&self) -> usize {
-        self.mmap.as_ref().len()
+        self.capacity
     }
 
     fn size(&self) -> usize {
@@ -310,9 +337,20 @@ impl Segment for SyncSegment {
     }
 
     fn remaining_size(&self) -> usize {
-        let unpadded = self.capacity() - self.size() - HEADER_LEN - CRC_LEN;
-        // Round down to a multiple of eight, since padding would otherwise be required.
-        unpadded & !7
+        (self.capacity() & !7).saturating_sub(self.size())
+                              .saturating_sub(HEADER_LEN)
+                              .saturating_sub(CRC_LEN)
+    }
+
+    fn shrink_to_fit(&mut self) -> Result<()> {
+        let size = self.size();
+        if size < self.capacity {
+            // TODO: this should be using truncate on posix so the file doesn't
+            // need to be opened.
+            try!(fs::File::open(&self.path)).set_len(size as u64)
+        } else {
+            Ok(())
+        }
     }
 
     fn rename<P>(&mut self, path: P) -> Result<()> where P: AsRef<Path> {
@@ -405,6 +443,10 @@ impl Segment for AsyncSegment {
         self.segment.append(entry)
     }
 
+    fn truncate(&mut self, from: usize) {
+        self.segment.truncate(from)
+    }
+
     fn len(&self) -> usize {
         self.segment.len()
     }
@@ -419,6 +461,10 @@ impl Segment for AsyncSegment {
 
     fn remaining_size(&self) -> usize {
         self.segment.remaining_size()
+    }
+
+    fn shrink_to_fit(&mut self) -> Result<()> {
+        self.segment.shrink_to_fit()
     }
 
     fn rename<P>(&mut self, path: P) -> Result<()> where P: AsRef<Path> {
@@ -450,6 +496,13 @@ impl Segment for AsyncSegment {
     }
 }
 
+impl fmt::Debug for AsyncSegment {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "AsyncSegment {{ path: {:?}, entry_count: {} }}",
+               &self.segment.path, self.segment.index.len())
+    }
+}
+
 /// Copies data from `src` to `dst`
 ///
 /// Panics if the length of `dst` is less than the length of `src`.
@@ -466,6 +519,16 @@ pub fn copy_memory(src: &[u8], dst: &mut [u8]) {
 /// Returns the number of padding bytes to add to a buffer to ensure 8-byte alignment.
 fn padding(len: usize) -> usize {
     4usize.wrapping_sub(len) & 7
+}
+
+/// Returns the overhead of storing an entry of length `len`.
+pub fn entry_overhead(len: usize) -> usize {
+    padding(len) + HEADER_LEN + CRC_LEN
+}
+
+/// Returns the fixed-overhead of segment metadata.
+pub fn segment_overhead() -> usize {
+    HEADER_LEN
 }
 
 fn flush_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, usize)>) {
@@ -515,14 +578,23 @@ fn flush_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, us
     info!("shutting down");
 }
 
+
 #[cfg(test)]
 mod test {
-    extern crate tempdir;
-    extern crate env_logger;
 
     use std::io::ErrorKind;
 
-    use super::{Segment, SyncSegment, padding};
+    use env_logger;
+    use tempdir;
+
+    use super::{
+        AsyncSegment,
+        Segment,
+        SyncSegment,
+        padding,
+    };
+
+    use test_utils::EntryGenerator;
 
     #[test]
     fn test_pad_len() {
@@ -545,11 +617,63 @@ mod test {
         assert_eq!(5, padding(15));
     }
 
-    fn test_segment(len: usize) -> SyncSegment {
+    fn create_sync_segment(len: usize) -> SyncSegment {
         let dir = tempdir::TempDir::new("segment").unwrap();
         let mut path = dir.path().to_path_buf();
-        path.push("test-segment");
+        path.push("sync-segment");
         SyncSegment::create(path, len).unwrap()
+    }
+
+    fn create_async_segment(len: usize) -> AsyncSegment {
+        let dir = tempdir::TempDir::new("segment").unwrap();
+        let mut path = dir.path().to_path_buf();
+        path.push("async-segment");
+        AsyncSegment::create(path, len).unwrap()
+    }
+
+    /// Checks that entries can be appended to a segment.
+    fn check_append<S>(segment: &mut S) where S: Segment {
+        let _ = env_logger::init();
+        assert_eq!(0, segment.len());
+
+        let entries: Vec<Vec<u8>> = EntryGenerator::with_segment_capacity(segment.capacity())
+                                                   .into_iter()
+                                                   .collect();
+
+        for (idx, entry) in entries.iter().enumerate() {
+            assert_eq!(idx, segment.append(entry).unwrap());
+            assert_eq!(&entry[..], segment.entry(idx).unwrap());
+        }
+
+        for (idx, entry) in entries.iter().enumerate() {
+            assert_eq!(&entry[..], segment.entry(idx).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_async_append() {
+        check_append(&mut create_async_segment(8));
+        check_append(&mut create_async_segment(9));
+        check_append(&mut create_async_segment(32));
+        check_append(&mut create_async_segment(100));
+        check_append(&mut create_async_segment(1023));
+        check_append(&mut create_async_segment(1024));
+        check_append(&mut create_async_segment(1025));
+        check_append(&mut create_sync_segment(4096));
+        check_append(&mut create_async_segment(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_sync_append() {
+        check_append(&mut create_sync_segment(8));
+        check_append(&mut create_sync_segment(9));
+        check_append(&mut create_sync_segment(32));
+        check_append(&mut create_sync_segment(100));
+        check_append(&mut create_sync_segment(1023));
+        check_append(&mut create_sync_segment(1024));
+        check_append(&mut create_sync_segment(1025));
+        check_append(&mut create_sync_segment(4096));
+        check_append(&mut create_sync_segment(8 * 1024 * 1024));
     }
 
     #[test]
@@ -562,7 +686,7 @@ mod test {
     #[test]
     fn test_entries() {
         let _ = env_logger::init();
-        let mut segment = test_segment(4096);
+        let mut segment = create_sync_segment(4096);
         let entries: &[&[u8]] = &[b"",
                                   b"0",
                                   b"01",

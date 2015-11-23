@@ -1,6 +1,4 @@
 #![feature(drain, slice_patterns)]
-#![cfg_attr(test, feature(custom_attribute, plugin))]
-#![cfg_attr(test, plugin(quickcheck_macros))]
 
 extern crate byteorder;
 extern crate crc;
@@ -9,11 +7,16 @@ extern crate fs2;
 extern crate memmap;
 extern crate rand;
 extern crate time;
-#[macro_use]
-extern crate log;
+
+#[macro_use] extern crate log;
+
+#[cfg(test)] extern crate quickcheck;
+#[cfg(test)] extern crate env_logger;
+#[cfg(test)] extern crate tempdir;
 
 mod mmap;
 mod segment;
+pub mod test_utils;
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -279,25 +282,27 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
 
 #[cfg(test)]
 mod test {
-    extern crate tempdir;
-    extern crate env_logger;
-    extern crate quickcheck;
 
     use std::error::Error;
 
+    use env_logger;
     use eventual::{Async, Future, Join};
     use fs2;
-    use test::quickcheck::TestResult;
+    use quickcheck;
+    use quickcheck::TestResult;
+    use tempdir;
 
     use super::Wal;
+    use test_utils::EntryGenerator;
 
     /// Check that entries appended to the write ahead log can be read back.
     #[test]
     fn check_wal() {
         let _ = env_logger::init();
-        fn wal(entries: Vec<Vec<u8>>) -> TestResult {
+        fn wal(entry_count: usize) -> TestResult {
             let dir = tempdir::TempDir::new("wal").unwrap();
             let mut wal = Wal::open(&dir.path()).unwrap();
+            let entries = EntryGenerator::new().into_iter().take(entry_count).collect::<Vec<_>>();
 
             for entry in &entries {
                 if let Err(error) = wal.append(entry).await() {
@@ -315,14 +320,15 @@ mod test {
             TestResult::passed()
         }
 
-        quickcheck::quickcheck(wal as fn(Vec<Vec<u8>>) -> TestResult);
+        quickcheck::quickcheck(wal as fn(usize) -> TestResult);
     }
 
     /// Check that the Wal will read previously written entries.
     #[test]
     fn check_wal_reopen() {
         let _ = env_logger::init();
-        fn wal(entries: Vec<Vec<u8>>) -> TestResult {
+        fn wal(entry_count: usize) -> TestResult {
+            let entries = EntryGenerator::new().into_iter().take(entry_count).collect::<Vec<_>>();
             let dir = tempdir::TempDir::new("wal").unwrap();
             {
                 let mut wal = Wal::open(&dir.path()).unwrap();
@@ -343,7 +349,7 @@ mod test {
             TestResult::passed()
         }
 
-        quickcheck::quickcheck(wal as fn(Vec<Vec<u8>>) -> TestResult);
+        quickcheck::quickcheck(wal as fn(usize) -> TestResult);
     }
 
     #[test]
