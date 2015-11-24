@@ -1,5 +1,3 @@
-pub mod creator;
-
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{
