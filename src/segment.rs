@@ -370,7 +370,7 @@ impl Segment for SyncSegment {
             Ok(())
         } else {
             self.flush_offset = end;
-            self.mmap.as_mut().flush_range(start, end)
+            self.mmap.as_mut().flush_range(start, end - start)
         }
     }
 
@@ -484,7 +484,7 @@ impl Segment for AsyncSegment {
             self.segment.set_flush_offset(end);
             let (complete, future) = Future::pair();
             // The flush channel does not close until the segment is dropped.
-            self.flush_chan.send((complete, start, end)).unwrap();
+            self.flush_chan.send((complete, start, end - start)).unwrap();
             future
         }
     }
