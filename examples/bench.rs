@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use docopt::Docopt;
 use eventual::Async;
-use histogram::{Histogram, HistogramConfig};
+use histogram::Histogram;
 use rand::Rng;
 use regex::Regex;
 
@@ -101,19 +101,8 @@ fn append(args: &Args) {
     let mut buf = vec![0; entry_size as usize];
     rand::weak_rng().fill_bytes(&mut buf);
 
-    let mut append_hist = Histogram::new(
-        HistogramConfig{
-            max_value: 10_000_000_000,
-            precision: 3,
-            max_memory: 0,
-        }).unwrap();
-
-    let mut sync_hist = Histogram::new(
-        HistogramConfig{
-            max_value: 10_000_000_000,
-            precision: 3,
-            max_memory: 0,
-        }).unwrap();
+    let mut append_hist = Histogram::new().unwrap();
+    let mut sync_hist = Histogram::new().unwrap();
 
     let mut entries = 0usize;
     let mut time: u64 = time::precise_time_ns();
