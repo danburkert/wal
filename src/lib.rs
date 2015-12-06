@@ -25,9 +25,10 @@ use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::ops;
 use std::path::{Path, PathBuf};
+use std::result;
 use std::str::FromStr;
-use std::thread;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread;
 
 use eventual::Future;
 use fs2::FileExt;
@@ -180,50 +181,86 @@ impl Wal {
         Ok(())
     }
 
-    pub fn append<T>(&mut self, entry: &T) -> Future<(), Error> where T: ops::Deref<Target=[u8]> {
+    pub fn append<T>(&mut self, entry: &T) -> Future<u64, Error> where T: ops::Deref<Target=[u8]> {
         if entry.len() > self.open_segment.segment.remaining_size() {
             if let Err(error) = self.retire_open_segment() {
                 return Future::error(error);
             }
         }
 
+
+        let open_start_index = self.open_segment_start_index();
+
         // TODO: figure out a solution for entries bigger than the segment size.
-        self.open_segment.segment.append(entry).unwrap();
-        self.open_segment.segment.flush()
+        let segment_index = self.open_segment.segment.append(entry).unwrap() as u64;
+        self.open_segment.segment.flush().map(move |_| open_start_index + segment_index)
     }
 
+    /// Retrieve the entry with the provided index from the log.
     pub fn entry(&self, index: u64) -> Option<&[u8]> {
-        let open_start_index = self.closed_segments
-                                   .last()
-                                   .map(|closed_segment| closed_segment.end_index as u64 + 1)
-                                   .unwrap_or(0);
+        let open_start_index = self.open_segment_start_index();
         if index >= open_start_index {
             return self.open_segment.segment.entry((index - open_start_index) as usize);
         }
 
-        match self.closed_segments.binary_search_by(|closed_segment| {
-            if index >= closed_segment.start_index {
-                if index <= closed_segment.end_index {
-                    Ordering::Equal
-                } else {
-                    Ordering::Greater
-                }
-            } else {
-                Ordering::Less
-            }
-        }) {
+        match self.find_closed_segment(index) {
             Ok(segment_index) => {
                 let segment = &self.closed_segments[segment_index];
                 segment.segment.entry((index - segment.start_index) as usize)
             },
-            Err(..) => {
-                assert!(index < self.closed_segments
-                                    .first()
-                                    .map(|closed_segment| closed_segment.start_index)
-                                    .unwrap_or(0));
+            Err(i) => {
+                // Sanity check that the missing index is less than the start of the log.
+                assert_eq!(0, i);
                 None
             }
         }
+    }
+
+    /// Truncates entries in the log beginning with `from`.
+    ///
+    /// Entries can be immediately appended to the log once this method returns,
+    /// but the truncated entries are not guaranteed to be removed until the
+    /// returned future completes successfully.
+    pub fn truncate(&mut self, from: u64) -> Future<(), Error> {
+        unimplemented!()
+        /*
+        let open_start_index = self.open_segment_start_index();
+        if from >= open_start_index {
+            self.open_segment.segment.truncate((from - open_start_index) as usize);
+        }
+
+        // Truncate the open segment completely.
+        self.open_segment.segment.truncate(0);
+
+        let delete_from = match self.find_closed_segment(from) {
+            Ok(segment_index) => {
+                let segment = &self.closed_segments[segment_index];
+                segment.segment.truncate((from - segment.start_index) as usize);
+            }
+        }
+
+        let closed_segment_index = self.find_closed_segment(from).unwrap_or(0);
+
+        for segment in self.closed_segments.drain(closed_segment_index..) {
+        */
+    }
+
+    /// Returns the start index of the open segment.
+    fn open_segment_start_index(&self) -> u64 {
+        self.closed_segments
+            .last()
+            .map(|segment| segment.end_index as u64 + 1)
+            .unwrap_or(0)
+    }
+
+    fn find_closed_segment(&self, index: u64) -> result::Result<usize, usize> {
+        self.closed_segments.binary_search_by(|segment| {
+            if index >= segment.start_index {
+                if index < segment.end_index { Ordering::Equal } else { Ordering::Greater }
+            } else {
+                Ordering::Less
+            }
+        })
     }
 }
 

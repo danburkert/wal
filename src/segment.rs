@@ -14,8 +14,7 @@ use std::thread;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
-use memmap::{Mmap, Protection};
-use mmap::MmapHandle;
+use memmap::{Mmap, Protection, MmapViewSync};
 use rand;
 use time::PreciseTime;
 use eventual::{Complete, Future};
@@ -139,7 +138,7 @@ pub trait Segment {
 
 pub struct SyncSegment {
     /// The segment file buffer.
-    mmap: MmapHandle,
+    mmap: MmapViewSync,
     /// The segment file path.
     path: PathBuf,
     /// Index of entry offset and lengths.
@@ -179,15 +178,15 @@ impl SyncSegment {
                                     .open(&path));
         try!(file.set_len(capacity as u64));
 
-        let mut mmap = MmapHandle::new(try!(Mmap::open_with_offset(&file,
-                                                                   Protection::ReadWrite,
-                                                                   0,
-                                                                   capacity)));
+        let mut mmap = try!(Mmap::open_with_offset(&file,
+                                                   Protection::ReadWrite,
+                                                   0,
+                                                   capacity)).into_view_sync();
         let seed = rand::random();
 
         // Write and flush the header information.
-        copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut().as_mut_slice()[..4] });
-        LittleEndian::write_u32(unsafe { &mut mmap.as_mut().as_mut_slice()[4..] }, seed);
+        copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut_slice()[..4] });
+        LittleEndian::write_u32(unsafe { &mut mmap.as_mut_slice()[4..] }, seed);
 
         Ok(SyncSegment {
             mmap: mmap,
@@ -203,7 +202,7 @@ impl SyncSegment {
     ///
     /// An individual file should only be opened by one segment at a time.
     pub fn open<P>(path: P) -> Result<SyncSegment> where P: AsRef<Path> {
-        let mmap = MmapHandle::new(try!(Mmap::open_path(&path, Protection::ReadWrite)));
+        let mmap = try!(Mmap::open_path(&path, Protection::ReadWrite)).into_view_sync();
         let mut index = Vec::new();
         let mut crc;
         {
@@ -212,7 +211,7 @@ impl SyncSegment {
             //
             // If the CRC of any entry does not match, then parsing stops and
             // the remainder of the file is considered empty.
-            let segment = unsafe { mmap.as_ref().as_slice() };
+            let segment = unsafe { mmap.as_slice() };
             crc = LittleEndian::read_u32(&segment[SEGMENT_HEADER.len()..]);
             let mut offset = HEADER_LEN;
 
@@ -233,7 +232,7 @@ impl SyncSegment {
             }
         }
 
-        let capacity = mmap.as_ref().len();
+        let capacity = mmap.len();
 
         Ok(SyncSegment {
             mmap: mmap,
@@ -246,14 +245,14 @@ impl SyncSegment {
     }
 
     fn as_slice(&self) -> &[u8] {
-        unsafe { self.mmap.as_ref().as_slice() }
+        unsafe { self.mmap.as_slice() }
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { self.mmap.as_mut().as_mut_slice() }
+        unsafe { self.mmap.as_mut_slice() }
     }
 
-    pub fn mmap(&self) -> MmapHandle {
+    pub fn mmap(&self) -> MmapViewSync {
         self.mmap.clone()
     }
 
@@ -370,7 +369,7 @@ impl Segment for SyncSegment {
             Ok(())
         } else {
             self.flush_offset = end;
-            self.mmap.as_mut().flush_range(start, end - start)
+            self.mmap.flush_range(start, end - start)
         }
     }
 
@@ -529,13 +528,13 @@ pub fn segment_overhead() -> usize {
     HEADER_LEN
 }
 
-fn flush_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, usize)>) {
+fn flush_loop(mut mmap: MmapViewSync, rx: Receiver<(Complete<(), Error>, usize, usize)>) {
     fn flush(offset: usize,
              len: usize,
-             mmap: &mut MmapHandle,
+             mmap: &mut MmapViewSync,
              completions: &mut Vec<Complete<(), Error>>) {
         let start = PreciseTime::now();
-        let result = mmap.as_mut().flush_range(offset, len);
+        let result = mmap.flush_range(offset, len);
         trace!("flushed {} bytes from offset {} in {}μs",
                 len, offset,
                 start.to(PreciseTime::now()).num_microseconds().unwrap());
@@ -575,7 +574,6 @@ fn flush_loop(mut mmap: MmapHandle, rx: Receiver<(Complete<(), Error>, usize, us
     }
     info!("shutting down");
 }
-
 
 #[cfg(test)]
 mod test {
