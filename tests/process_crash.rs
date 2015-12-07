@@ -56,16 +56,16 @@ fn test() {
 
     assert_eq!(EXIT_CODE, exit_code);
 
-    let segment = wal::SyncSegment::open(path).unwrap();
+    let segment = wal::Segment::open(path).unwrap();
     let entries = EntryGenerator::with_seed_and_segment_capacity(seed, SEGMENT_CAPACITY);
 
     for (i, entry) in entries.into_iter().enumerate() {
-        assert_eq!(&entry[..], segment.entry(i).unwrap());
+        assert_eq!(&entry[..], &*segment.entry(i).unwrap());
     }
 }
 
 fn subprocess(path: String, seed: usize) {
-    let mut segment = wal::SyncSegment::create(path, SEGMENT_CAPACITY as usize).unwrap();
+    let mut segment = wal::Segment::create(path, SEGMENT_CAPACITY as usize).unwrap();
 
     for entry in EntryGenerator::with_seed_and_segment_capacity(seed, SEGMENT_CAPACITY) {
         segment.append(&entry).expect("segment capacity exhausted");

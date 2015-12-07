@@ -16,7 +16,7 @@ use histogram::Histogram;
 use rand::Rng;
 use regex::Regex;
 
-use wal::{Segment, SyncSegment};
+use wal::Segment;
 
 static USAGE: &'static str = "
 Usage:
@@ -96,7 +96,7 @@ fn append(args: &Args) {
     println!("entry size: {}, segment size: {}, batch size: {}",
              format_bytes(entry_size), format_bytes(segment_size), args.flag_batch);
 
-    let mut segment = SyncSegment::create(path, segment_size).unwrap();
+    let mut segment = Segment::create(path, segment_size).unwrap();
 
     let mut buf = vec![0; entry_size as usize];
     rand::weak_rng().fill_bytes(&mut buf);

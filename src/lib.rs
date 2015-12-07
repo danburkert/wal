@@ -2,7 +2,6 @@
 
 extern crate byteorder;
 extern crate crc;
-extern crate eventual;
 extern crate fs2;
 extern crate memmap;
 extern crate rand;
@@ -14,7 +13,6 @@ extern crate time;
 #[cfg(test)] extern crate env_logger;
 #[cfg(test)] extern crate tempdir;
 
-mod mmap;
 mod segment;
 pub mod test_utils;
 
@@ -30,10 +28,9 @@ use std::str::FromStr;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
-use eventual::Future;
 use fs2::FileExt;
 
-pub use segment::{AsyncSegment, Segment, SyncSegment};
+pub use segment::{Entry, Segment};
 
 #[derive(Debug)]
 pub struct WalOptions {
@@ -57,14 +54,14 @@ impl Default for WalOptions {
 /// An open segment and its ID.
 struct OpenSegment {
     pub id: u64,
-    pub segment: AsyncSegment,
+    pub segment: Segment,
 }
 
 /// A closed segment, and the associated start and stop indices.
 struct ClosedSegment {
     pub start_index: u64,
     pub end_index: u64,
-    pub segment: SyncSegment,
+    pub segment: Segment,
 }
 
 enum WalSegment {
@@ -181,13 +178,10 @@ impl Wal {
         Ok(())
     }
 
-    pub fn append<T>(&mut self, entry: &T) -> Future<u64, Error> where T: ops::Deref<Target=[u8]> {
+    pub fn append<T>(&mut self, entry: &T) -> Result<u64> where T: ops::Deref<Target=[u8]> {
         if entry.len() > self.open_segment.segment.remaining_size() {
-            if let Err(error) = self.retire_open_segment() {
-                return Future::error(error);
-            }
+            try!(self.retire_open_segment());
         }
-
 
         let open_start_index = self.open_segment_start_index();
 
@@ -197,7 +191,7 @@ impl Wal {
     }
 
     /// Retrieve the entry with the provided index from the log.
-    pub fn entry(&self, index: u64) -> Option<&[u8]> {
+    pub fn entry(&self, index: u64) -> Option<Entry> {
         let open_start_index = self.open_segment_start_index();
         if index >= open_start_index {
             return self.open_segment.segment.entry((index - open_start_index) as usize);
@@ -221,7 +215,7 @@ impl Wal {
     /// Entries can be immediately appended to the log once this method returns,
     /// but the truncated entries are not guaranteed to be removed until the
     /// returned future completes successfully.
-    pub fn truncate(&mut self, from: u64) -> Future<(), Error> {
+    pub fn truncate(&mut self, from: u64) {
         unimplemented!()
         /*
         let open_start_index = self.open_segment_start_index();
@@ -282,7 +276,7 @@ fn close_segment(OpenSegment { mut segment, id }: OpenSegment,
     debug!("closing open segment {} with entries {} through {}", id, start_index, end_index);
     Ok(ClosedSegment { start_index: start_index,
                        end_index: end_index,
-                       segment: segment.into_sync_segment() })
+                       segment: segment })
 }
 
 fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
@@ -301,13 +295,13 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
     match &*filename.split('-').collect::<Vec<&str>>() {
         ["open", id] => {
             let id = try!(u64::from_str(id).map_err(|_| error()));
-            let segment = try!(AsyncSegment::open(entry.path()));
+            let segment = try!(Segment::open(entry.path()));
             Ok(WalSegment::Open(OpenSegment { segment: segment, id: id }))
         },
         ["closed", start, end] => {
             let start = try!(u64::from_str(start).map_err(|_| error()));
             let end = try!(u64::from_str(end).map_err(|_| error()));
-            let segment = try!(SyncSegment::open(entry.path()));
+            let segment = try!(Segment::open(entry.path()));
             Ok(WalSegment::Closed(ClosedSegment { start_index: start,
                                                   end_index: end,
                                                   segment: segment }))
@@ -388,7 +382,7 @@ fn create_loop(tx: SyncSender<OpenSegment>,
 
     while cont {
         path.push(format!("open-{}", id));
-        let segment = OpenSegment { id: id, segment: try!(AsyncSegment::create(&path, capacity)) };
+        let segment = OpenSegment { id: id, segment: try!(Segment::create(&path, capacity)) };
         path.pop();
         id += 1;
         // Sync the directory, guaranteeing that the segment file is durably
@@ -407,7 +401,6 @@ mod test {
     use std::error::Error;
 
     use env_logger;
-    use eventual::{Async, Future, Join};
     use fs2;
     use quickcheck;
     use quickcheck::TestResult;
@@ -426,14 +419,14 @@ mod test {
             let entries = EntryGenerator::new().into_iter().take(entry_count).collect::<Vec<_>>();
 
             for entry in &entries {
-                if let Err(error) = wal.append(entry).await() {
+                if let Err(error) = wal.append(entry) {
                     return TestResult::error(error.description());
                 }
             }
 
             for (index, expected) in entries.iter().enumerate() {
                 match wal.entry(index as u64) {
-                    Some(entry) if entry != &expected[..] => return TestResult::failed(),
+                    Some(ref entry) if &entry[..] != &expected[..] => return TestResult::failed(),
                     None => return TestResult::failed(),
                     _ => (),
                 }
@@ -462,7 +455,7 @@ mod test {
             // Check that all of the entries are present.
             for (index, expected) in entries.iter().enumerate() {
                 match wal.entry(index as u64) {
-                    Some(entry) if entry != &expected[..] => return TestResult::failed(),
+                    Some(ref entry) if &entry[..] != &expected[..] => return TestResult::failed(),
                     None => return TestResult::failed(),
                     _ => (),
                 }
@@ -485,10 +478,6 @@ mod test {
         for _ in 1..10 {
             completions.push(wal.append(&entry));
         }
-
-        let (c, f) = Future::pair();
-        completions.join(c);
-        f.await().unwrap();
     }
 
     /// Tests that two Wal instances can not coexist for the same directory.
