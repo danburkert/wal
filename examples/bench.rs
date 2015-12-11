@@ -1,5 +1,4 @@
 extern crate docopt;
-extern crate eventual;
 extern crate histogram;
 extern crate rand;
 extern crate regex;
@@ -11,7 +10,6 @@ use std::path::Path;
 use std::str::FromStr;
 
 use docopt::Docopt;
-use eventual::Async;
 use histogram::Histogram;
 use rand::Rng;
 use regex::Regex;

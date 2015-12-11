@@ -273,6 +273,7 @@ fn close_segment(OpenSegment { mut segment, id }: OpenSegment,
     let new_path = segment.path()
                           .with_file_name(format!("closed-{}-{}", start_index, end_index));
     try!(segment.rename(new_path));
+    try!(segment.shrink_to_fit());
     debug!("closing open segment {} with entries {} through {}", id, start_index, end_index);
     Ok(ClosedSegment { start_index: start_index,
                        end_index: end_index,

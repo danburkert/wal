@@ -6,7 +6,6 @@ authors = ["Dan Burkert <dan@danburkert.com>"]
 [dependencies]
 byteorder = "0.4"
 crc = "1"
-eventual = "0.1"
 fs2 = "0.2"
 log = "0.3"
 memmap = "0.2"

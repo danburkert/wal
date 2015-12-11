@@ -9,7 +9,6 @@ use std::io::{
 use std::ops;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::ops::Deref;
 
