@@ -121,15 +121,14 @@ impl Segment {
     /// The caller is responsible for flushing the directory in order to
     /// guarantee that the segment is durable in the event of a crash.
     pub fn create<P>(path: P, capacity: usize) -> Result<Segment> where P: AsRef<Path> {
+        // Round capacity down to the nearest 8-byte alignment, since the
+        // segment would not be able to take advantage of the space.
+        let capacity = capacity & !7;
         if capacity < HEADER_LEN {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid segment capacity"));
         }
 
-        let file = try!(OpenOptions::new()
-                                    .read(true)
-                                    .write(true)
-                                    .create(true)
-                                    .open(&path));
+        let file = try!(OpenOptions::new().read(true).write(true).create(true).open(&path));
         try!(file.set_len(capacity as u64));
 
         let mut mmap = try!(Mmap::open_with_offset(&file,
@@ -155,7 +154,20 @@ impl Segment {
     ///
     /// An individual file should only be opened by one segment at a time.
     pub fn open<P>(path: P) -> Result<Segment> where P: AsRef<Path> {
-        let mmap = try!(Mmap::open_path(&path, Protection::ReadWrite)).into_view_sync();
+        let file = try!(OpenOptions::new().read(true).write(true).create(false).open(&path));
+        let capacity = try!(file.metadata()).len();
+        if capacity > usize::max_value() as u64 {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid segment capacity"));
+        }
+
+        // Round capacity down to the nearest 8-byte alignment, since the
+        // segment would not be able to take advantage of the space.
+        let capacity = capacity as usize & !7;
+        let mmap = try!(Mmap::open_with_offset(&file,
+                                               Protection::ReadWrite,
+                                               0,
+                                               capacity)).into_view_sync();
+
         let mut index = Vec::new();
         let mut crc;
         {
@@ -231,8 +243,7 @@ impl Segment {
     /// The entry may be immediately read from the log, but it is not guaranteed
     /// to be durably stored on disk until the segment is successfully flushed.
     pub fn append<T>(&mut self, entry: &T) -> Option<usize> where T: ops::Deref<Target=[u8]> {
-        let remaining_size = self.remaining_size();
-        if remaining_size == 0 || entry.len() > self.remaining_size() {
+        if !self.sufficient_capacity(entry.len()) {
             debug!("{:?}: insufficient remaining capacity to append {} byte entry",
                    self, entry.len());
             return None;
@@ -319,22 +330,25 @@ impl Segment {
     }
 
     pub fn ensure_capacity(&mut self, entry_size: usize) -> Result<()> {
-        let capacity = entry_size + padding(entry_size) + HEADER_LEN + CRC_LEN + self.size();
-        if capacity > self.capacity() {
+        let required_capacity =
+            entry_size + padding(entry_size) + HEADER_LEN + CRC_LEN + self.size();
+        // Sanity check the 8-byte alignment invariant.
+        assert_eq!(required_capacity & !7, required_capacity);
+        if required_capacity > self.capacity() {
             info!("{:?}: extending capacity to {} for entry of size {}",
-                  self, capacity, entry_size);
+                  self, required_capacity, entry_size);
             try!(self.flush());
             let file = try!(OpenOptions::new()
                                         .read(true)
                                         .write(true)
                                         .create(false)
                                         .open(&self.path));
-            try!(file.set_len(capacity as u64));
+            try!(file.set_len(required_capacity as u64));
 
             let mut mmap = try!(Mmap::open_with_offset(&file,
                                                        Protection::ReadWrite,
                                                        0,
-                                                       capacity)).into_view_sync();
+                                                       required_capacity)).into_view_sync();
             mem::swap(&mut mmap, &mut self.mmap);
         }
         Ok(())
@@ -345,7 +359,7 @@ impl Segment {
         self.index.len()
     }
 
-    /// Returns the capacity of the segment in bytes.
+    /// Returns the capacity (file-size) of the segment in bytes
     ///
     /// Each entry is stored with a header and padding, so the entire capacity
     /// will not be available for entry data.
@@ -362,15 +376,14 @@ impl Segment {
             .unwrap_or(HEADER_LEN)
     }
 
-    /// Returns the number of bytes available for the next segment.
-    ///
-    /// This method can be used to make sure that an entry can be appended to
-    /// the segment without allocating additional file space.
-    pub fn remaining_size(&self) -> usize {
-        (self.capacity() & !7).saturating_sub(self.size())
-                              .saturating_sub(HEADER_LEN)
-                              .saturating_sub(CRC_LEN)
+    /// Returns `true` if the segment has sufficient remaining capacity to
+    /// append an entry of size `entry_len`.
+    pub fn sufficient_capacity(&self, entry_len: usize) -> bool {
+        (self.capacity() - self.size()).checked_sub(HEADER_LEN + CRC_LEN)
+                                       .map(|rem| rem >= entry_len + padding(entry_len))
+                                       .unwrap_or(false)
     }
+
 
     /// Returns the path to the segment file.
     pub fn path(&self) -> &Path {

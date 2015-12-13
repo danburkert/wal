@@ -186,14 +186,11 @@ impl Wal {
     }
 
     pub fn append<T>(&mut self, entry: &T) -> Result<u64> where T: ops::Deref<Target=[u8]> {
-        let remaining_size = self.open_segment.segment.remaining_size();
-        if remaining_size == 0 || entry.len() > remaining_size {
-            if self.open_segment.segment.len() == 0 {
-                try!(self.open_segment.segment.ensure_capacity(entry.len()));
-            } else {
+        if !self.open_segment.segment.sufficient_capacity(entry.len()) {
+            if self.open_segment.segment.len() > 0 {
                 try!(self.retire_open_segment());
-                try!(self.open_segment.segment.ensure_capacity(entry.len()));
             }
+            try!(self.open_segment.segment.ensure_capacity(entry.len()));
         }
 
         Ok(self.open_segment_start_index()
