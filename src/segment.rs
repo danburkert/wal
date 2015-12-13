@@ -14,9 +14,9 @@ use std::ops::Deref;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
+use eventual::{Async, Future};
 use memmap::{Mmap, Protection, MmapViewSync};
 use rand;
-use time::PreciseTime;
 
 /// The magic bytes and version tag of the segment header.
 const SEGMENT_HEADER: &'static [u8; 4] = b"wal\0";
@@ -243,7 +243,7 @@ impl Segment {
         let mut crc = self.crc;
 
         LittleEndian::write_u64(&mut self.as_mut_slice()[offset..], entry.len() as u64);
-        copy_memory(entry, &mut self.as_mut_slice()[offset + HEADER_LEN..]);
+        copy_memory(entry.deref(), &mut self.as_mut_slice()[offset + HEADER_LEN..]);
 
         if padding > 0 {
             let zeros: [u8; 8] = [0; 8];
@@ -293,20 +293,24 @@ impl Segment {
     }
 
     /// Flushes recently written entries to durable storage.
-    pub fn flush_async<F>(&mut self, callback: F) where F: FnOnce(Result<()>) + Send + 'static {
+    pub fn flush_async(&mut self) -> Future<(), Error> {
         let start = self.flush_offset();
         let end = self.size();
         assert!(start <= end);
 
         if start == end {
-            callback(Ok(()));
+            Future::of(())
         } else {
             let mut view = unsafe { self.mmap.clone() };
             self.set_flush_offset(end);
+            let (complete, future) = Future::pair();
             thread::spawn(move || {
-                callback(view.restrict(start, end - start)
-                             .and_then(|_| view.flush()))
+                match view.restrict(start, end - start).and_then(|_| view.flush()) {
+                    Ok(_) => complete.complete(()),
+                    Err(error) => complete.fail(error),
+                }
             });
+            future
         }
     }
 
@@ -340,19 +344,6 @@ impl Segment {
         (self.capacity() & !7).saturating_sub(self.size())
                               .saturating_sub(HEADER_LEN)
                               .saturating_sub(CRC_LEN)
-    }
-
-    /// Shrinks the file backing this segment to the minimum size necessary to
-    /// hold the current entries.
-    pub fn shrink_to_fit(&mut self) -> Result<()> {
-        let size = self.size();
-        if size < self.capacity() {
-            // TODO: this should be using truncate on posix so the file doesn't
-            // need to be opened.
-            try!(fs::File::open(&self.path)).set_len(size as u64)
-        } else {
-            Ok(())
-        }
     }
 
     /// Returns the path to the segment file.

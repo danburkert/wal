@@ -1,7 +1,8 @@
-#![feature(drain, slice_patterns)]
+#![feature(slice_patterns)]
 
 extern crate byteorder;
 extern crate crc;
+extern crate eventual;
 extern crate fs2;
 extern crate memmap;
 extern crate rand;
@@ -29,6 +30,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
 use fs2::FileExt;
+use eventual::{Async, Future};
 
 pub use segment::{Entry, Segment};
 
@@ -52,15 +54,16 @@ impl Default for WalOptions {
 }
 
 /// An open segment and its ID.
+#[derive(Debug)]
 struct OpenSegment {
     pub id: u64,
     pub segment: Segment,
 }
 
 /// A closed segment, and the associated start and stop indices.
+#[derive(Debug)]
 struct ClosedSegment {
     pub start_index: u64,
-    pub end_index: u64,
     pub segment: Segment,
 }
 
@@ -78,6 +81,9 @@ pub struct Wal {
     /// lock for the lifetime of the log.
     #[allow(dead_code)]
     dir: File,
+
+    /// Keeps track of the flush completions of previously closed segments.
+    flush: Option<Future<(), Error>>,
 }
 
 impl Wal {
@@ -101,27 +107,23 @@ impl Wal {
         }
 
         // Validate the closed segments. They must be non-overlapping, and contiguous.
-        closed_segments.sort_by(|&ClosedSegment { start_index: left_start, end_index: left_end, .. },
-                                 &ClosedSegment { start_index: right_start, end_index: right_end, .. }| {
-            (left_start, left_end).cmp(&(right_start, right_end))
-        });
-        let mut prev_end = None;
-        for &ClosedSegment{ start_index, end_index, .. } in &closed_segments {
-            if let Some(prev_end) = prev_end {
-                if prev_end + 1 != start_index {
-                    return Err(Error::new(ErrorKind::InvalidData,
-                                          format!("missing segment(s) containing wal
-                                                   entries {} to {}", prev_end, start_index)));
-                }
+        closed_segments.sort_by(|a, b| a.start_index.cmp(&b.start_index));
+        let mut next_start_index = 0;
+        for &ClosedSegment { start_index, ref segment, .. } in &closed_segments {
+            if start_index > next_start_index {
+                return Err(Error::new(ErrorKind::InvalidData,
+                                      format!("missing segment(s) containing wal entries {} to {}",
+                                              next_start_index, start_index)));
+            } else if start_index < next_start_index {
+                // TODO: figure out what to do here.
+                // Current thinking is the previous segment should be truncated.
+                unimplemented!()
             }
-            prev_end = Some(end_index)
+            next_start_index += segment.len() as u64;
         }
 
         // Validate the open segments.
-        open_segments.sort_by(|&OpenSegment { id: left_id, .. },
-                               &OpenSegment { id: ref right_id, .. }| {
-            left_id.cmp(right_id)
-        });
+        open_segments.sort_by(|a, b| a.id.cmp(&b.id));
 
         // The latest open segment, may already have segments.
         let mut open_segment: Option<OpenSegment> = None;
@@ -138,9 +140,8 @@ impl Wal {
                 let stranded_segment = open_segment.take();
                 open_segment = Some(segment);
                 if let Some(segment) = stranded_segment {
-                    let closed_segment = try!(close_segment(segment,
-                                                            prev_end.map(|i| i + 1).unwrap_or(0)));
-                    prev_end = Some(closed_segment.end_index);
+                    let closed_segment = try!(close_segment(segment, next_start_index));
+                    next_start_index += closed_segment.segment.len() as u64;
                     closed_segments.push(closed_segment);
                 }
             } else if open_segment.is_none() {
@@ -165,6 +166,7 @@ impl Wal {
             closed_segments: closed_segments,
             creator: creator,
             dir: dir,
+            flush: None,
         })
     }
 
@@ -172,8 +174,13 @@ impl Wal {
         // TODO: time the next call
         let mut segment = try!(self.creator.next());
         mem::swap(&mut self.open_segment, &mut segment);
-        let len = self.closed_segments.len();
-        let start_index = if len > 0 { self.closed_segments[len - 1].end_index + 1 } else { 0 };
+
+        self.flush = Some(self.flush
+                              .take()
+                              .unwrap_or(Future::of(()))
+                              .and(segment.segment.flush_async()));
+
+        let start_index = self.open_segment_start_index();
         self.closed_segments.push(try!(close_segment(segment, start_index)));
         Ok(())
     }
@@ -183,11 +190,9 @@ impl Wal {
             try!(self.retire_open_segment());
         }
 
-        let open_start_index = self.open_segment_start_index();
-
         // TODO: figure out a solution for entries bigger than the segment size.
-        let segment_index = self.open_segment.segment.append(entry).unwrap() as u64;
-        self.open_segment.segment.flush().map(move |_| open_start_index + segment_index)
+        Ok(self.open_segment_start_index()
+           + self.open_segment.segment.append(entry).unwrap() as u64)
     }
 
     /// Retrieve the entry with the provided index from the log.
@@ -214,47 +219,64 @@ impl Wal {
     ///
     /// Entries can be immediately appended to the log once this method returns,
     /// but the truncated entries are not guaranteed to be removed until the
-    /// returned future completes successfully.
+    /// wal is flushed.
     pub fn truncate(&mut self, from: u64) {
-        unimplemented!()
-        /*
         let open_start_index = self.open_segment_start_index();
         if from >= open_start_index {
             self.open_segment.segment.truncate((from - open_start_index) as usize);
-        }
+        } else {
+            // Truncate the open segment completely.
+            self.open_segment.segment.truncate(0);
 
-        // Truncate the open segment completely.
-        self.open_segment.segment.truncate(0);
-
-        let delete_from = match self.find_closed_segment(from) {
-            Ok(segment_index) => {
-                let segment = &self.closed_segments[segment_index];
-                segment.segment.truncate((from - segment.start_index) as usize);
+            match self.find_closed_segment(from) {
+                Ok(index) => {
+                    if from == self.closed_segments[index].start_index {
+                        for segment in self.closed_segments.drain(index..) {
+                            // TODO: this should be async
+                            segment.segment.delete().unwrap();
+                        }
+                    } else {
+                        {
+                            let segment = &mut self.closed_segments[index];
+                            segment.segment.truncate((from - segment.start_index) as usize)
+                        }
+                        if index + 1 < self.closed_segments.len() {
+                            for segment in self.closed_segments.drain(index + 1..) {
+                                // TODO: this should be async
+                                segment.segment.delete().unwrap();
+                            }
+                        }
+                    }
+                },
+                Err(index) => {
+                    // The truncate index is before the first entry of the wal
+                    assert!(from <= self.closed_segments.get(index)
+                                                        .map(|segment| segment.start_index)
+                                                        .unwrap_or(0));
+                    for segment in self.closed_segments.drain(..) {
+                        // TODO: this should be async
+                        segment.segment.delete().unwrap();
+                    }
+                }
             }
         }
-
-        let closed_segment_index = self.find_closed_segment(from).unwrap_or(0);
-
-        for segment in self.closed_segments.drain(closed_segment_index..) {
-        */
     }
 
     /// Returns the start index of the open segment.
     fn open_segment_start_index(&self) -> u64 {
         self.closed_segments
             .last()
-            .map(|segment| segment.end_index as u64 + 1)
+            .map(|segment| segment.start_index + segment.segment.len() as u64)
             .unwrap_or(0)
     }
 
     fn find_closed_segment(&self, index: u64) -> result::Result<usize, usize> {
-        self.closed_segments.binary_search_by(|segment| {
-            if index >= segment.start_index {
-                if index < segment.end_index { Ordering::Equal } else { Ordering::Greater }
-            } else {
-                Ordering::Less
-            }
-        })
+        let result = self.closed_segments.binary_search_by(|segment| {
+            if index < segment.start_index { Ordering::Greater }
+            else if index >= segment.start_index + segment.segment.len() as u64 { Ordering::Less }
+            else { Ordering::Equal }
+        });
+        result
     }
 }
 
@@ -265,19 +287,11 @@ impl fmt::Debug for Wal {
     }
 }
 
-fn close_segment(OpenSegment { mut segment, id }: OpenSegment,
-                 start_index: u64)
-                 -> Result<ClosedSegment> {
-    let end_index = start_index + segment.len() as u64;
-
-    let new_path = segment.path()
-                          .with_file_name(format!("closed-{}-{}", start_index, end_index));
-    try!(segment.rename(new_path));
-    try!(segment.shrink_to_fit());
-    debug!("closing open segment {} with entries {} through {}", id, start_index, end_index);
-    Ok(ClosedSegment { start_index: start_index,
-                       end_index: end_index,
-                       segment: segment })
+fn close_segment(mut segment: OpenSegment, start_index: u64) -> Result<ClosedSegment> {
+    let new_path = segment.segment.path().with_file_name(format!("closed-{}", start_index));
+    debug!("closing segment {:?}, start index: {:?}", segment, new_path);
+    try!(segment.segment.rename(new_path));
+    Ok(ClosedSegment { start_index: start_index, segment: segment.segment })
 }
 
 fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
@@ -299,13 +313,10 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
             let segment = try!(Segment::open(entry.path()));
             Ok(WalSegment::Open(OpenSegment { segment: segment, id: id }))
         },
-        ["closed", start, end] => {
+        ["closed", start] => {
             let start = try!(u64::from_str(start).map_err(|_| error()));
-            let end = try!(u64::from_str(end).map_err(|_| error()));
             let segment = try!(Segment::open(entry.path()));
-            Ok(WalSegment::Closed(ClosedSegment { start_index: start,
-                                                  end_index: end,
-                                                  segment: segment }))
+            Ok(WalSegment::Closed(ClosedSegment { start_index: start, segment: segment }))
         },
         _ => Err(error()),
     }
@@ -407,7 +418,7 @@ mod test {
     use quickcheck::TestResult;
     use tempdir;
 
-    use super::{SegmentCreator, Wal};
+    use super::{SegmentCreator, Wal, WalOptions};
     use test_utils::EntryGenerator;
 
     /// Check that entries appended to the write ahead log can be read back.
@@ -467,6 +478,40 @@ mod test {
         quickcheck::quickcheck(wal as fn(usize) -> TestResult);
     }
 
+    /// Check that entries appended to the write ahead log can be read back.
+    #[test]
+    fn check_truncate() {
+        let _ = env_logger::init();
+        fn truncate(entry_count: usize, truncate: usize) -> TestResult {
+            if truncate > entry_count { return TestResult::discard(); }
+            let dir = tempdir::TempDir::new("wal").unwrap();
+            let mut wal = Wal::open(&dir.path()).unwrap();
+            let entries = EntryGenerator::new().into_iter().take(entry_count).collect::<Vec<_>>();
+
+            for entry in &entries {
+                if let Err(error) = wal.append(entry) {
+                    return TestResult::error(error.description());
+                }
+            }
+
+            wal.truncate(truncate as u64);
+
+            for (index, expected) in entries.iter().take(truncate).enumerate() {
+                match wal.entry(index as u64) {
+                    Some(ref entry) if &entry[..] != &expected[..] => return TestResult::failed(),
+                    None => return TestResult::failed(),
+                    _ => (),
+                }
+            }
+
+            TestResult::from_bool(wal.entry(truncate as u64).is_none());
+
+            TestResult::passed()
+        }
+
+        quickcheck::quickcheck(truncate as fn(usize, usize) -> TestResult);
+    }
+
     #[test]
     fn test_append() {
         let _ = env_logger::init();
@@ -474,10 +519,37 @@ mod test {
         let mut wal = Wal::open(&dir.path()).unwrap();
 
         let entry: &[u8] = &[42u8; 4096];
-        let mut completions = Vec::new();
-
         for _ in 1..10 {
-            completions.push(wal.append(&entry));
+            wal.append(&entry).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_truncate() {
+        let _ = env_logger::init();
+        let dir = tempdir::TempDir::new("wal").unwrap();
+        // 2 entries should fit in each segment
+        let mut wal = Wal::with_options(&dir.path(),
+                                        &WalOptions { segment_capacity: 4096,
+                                                      segment_queue_len: 3 }).unwrap();
+
+        let entry: [u8; 2000] = [42u8; 2000];
+
+        for truncate_index in 0..10 {
+            println!("testing truncate_index {}", truncate_index);
+            assert!(wal.entry(0).is_none());
+            for i in 0..10 {
+                assert_eq!(i, wal.append(&&entry[..]).unwrap());
+            }
+
+            wal.truncate(truncate_index);
+
+            assert!(wal.entry(truncate_index).is_none());
+
+            if truncate_index > 0 {
+                assert!(wal.entry(truncate_index - 1).is_some());
+            }
+            wal.truncate(0);
         }
     }
 

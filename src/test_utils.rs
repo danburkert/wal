@@ -40,7 +40,7 @@ impl EntryGenerator {
     }
 
     pub fn with_seed_and_segment_capacity(seed: usize, size: usize) -> EntryGenerator {
-        println!("Creating EntryGenerator with seed {}", seed);
+        info!("Creating EntryGenerator with seed {}", seed);
         EntryGenerator {
             seed: seed,
             rng: rand::StdRng::from_seed(&[seed]),
