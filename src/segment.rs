@@ -6,11 +6,12 @@ use std::io::{
     Result,
     Write,
 };
+use std::mem;
+use std::ops::Deref;
 use std::ops;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread;
-use std::ops::Deref;
 
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
@@ -120,7 +121,6 @@ impl Segment {
     /// The caller is responsible for flushing the directory in order to
     /// guarantee that the segment is durable in the event of a crash.
     pub fn create<P>(path: P, capacity: usize) -> Result<Segment> where P: AsRef<Path> {
-        // TODO: roll capacity up to nearest disk allocation granularity.
         if capacity < HEADER_LEN {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid segment capacity"));
         }
@@ -231,9 +231,13 @@ impl Segment {
     /// The entry may be immediately read from the log, but it is not guaranteed
     /// to be durably stored on disk until the segment is successfully flushed.
     pub fn append<T>(&mut self, entry: &T) -> Option<usize> where T: ops::Deref<Target=[u8]> {
-        if entry.len() > self.remaining_size() {
+        let remaining_size = self.remaining_size();
+        if remaining_size == 0 || entry.len() > self.remaining_size() {
+            debug!("{:?}: insufficient remaining capacity to append {} byte entry",
+                   self, entry.len());
             return None;
         }
+        info!("{:?}: appending {} byte entry", self, entry.len());
 
         let padding = padding(entry.len());
         let padded_len = entry.len() + padding;
@@ -314,6 +318,28 @@ impl Segment {
         }
     }
 
+    pub fn ensure_capacity(&mut self, entry_size: usize) -> Result<()> {
+        let capacity = entry_size + padding(entry_size) + HEADER_LEN + CRC_LEN + self.size();
+        if capacity > self.capacity() {
+            info!("{:?}: extending capacity to {} for entry of size {}",
+                  self, capacity, entry_size);
+            try!(self.flush());
+            let file = try!(OpenOptions::new()
+                                        .read(true)
+                                        .write(true)
+                                        .create(false)
+                                        .open(&self.path));
+            try!(file.set_len(capacity as u64));
+
+            let mut mmap = try!(Mmap::open_with_offset(&file,
+                                                       Protection::ReadWrite,
+                                                       0,
+                                                       capacity)).into_view_sync();
+            mem::swap(&mut mmap, &mut self.mmap);
+        }
+        Ok(())
+    }
+
     /// Returns the number of entries in the segment.
     pub fn len(&self) -> usize {
         self.index.len()
@@ -369,7 +395,8 @@ impl Segment {
 
 impl fmt::Debug for Segment {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Segment {{ path: {:?}, entry_count: {} }}", &self.path, self.index.len())
+        write!(f, "Segment {{ path: {:?}, entries: {}, space: ({}/{}) }}",
+               &self.path, self.index.len(), self.size(), self.capacity())
     }
 }
 
