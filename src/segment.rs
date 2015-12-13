@@ -16,6 +16,7 @@ use std::thread;
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
 use eventual::{Async, Future};
+use log;
 use memmap::{Mmap, Protection, MmapViewSync};
 use rand;
 
@@ -93,6 +94,12 @@ impl fmt::Debug for Entry {
 /// the length of the data as a u64 in little-endian format. The footer includes
 /// between 0 and 7 bytes of padding to extend the total length of the entry to
 /// a multiple of 8, followed by the CRC code of the length, data, and padding.
+///
+/// ### Logging
+///
+/// Segment modifications are logged. Metadata operations (create, open, resize,
+/// file rename) are logged at `info` level, flush events are logged at `debug`
+/// level, and entry events (append and truncate) are logged at `trace` level.
 pub struct Segment {
     /// The segment file buffer.
     mmap: MmapViewSync,
@@ -118,8 +125,8 @@ impl Segment {
     ///
     /// An individual file should only be opened by a single segment at a time.
     ///
-    /// The caller is responsible for flushing the directory in order to
-    /// guarantee that the segment is durable in the event of a crash.
+    /// The caller is responsible for flushing the containing directory in order
+    /// to guarantee that the segment is durable in the event of a crash.
     pub fn create<P>(path: P, capacity: usize) -> Result<Segment> where P: AsRef<Path> {
         // Round capacity down to the nearest 8-byte alignment, since the
         // segment would not be able to take advantage of the space.
@@ -141,13 +148,15 @@ impl Segment {
         copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut_slice()[..4] });
         LittleEndian::write_u32(unsafe { &mut mmap.as_mut_slice()[4..] }, seed);
 
-        Ok(Segment {
+        let segment = Segment {
             mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: Vec::new(),
             crc: seed,
             flush_offset: 0,
-        })
+        };
+        info!("{:?}: created", segment);
+        Ok(segment)
     }
 
     /// Opens the segment file at the specified path.
@@ -197,13 +206,15 @@ impl Segment {
             }
         }
 
-        Ok(Segment {
+        let segment = Segment {
             mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: index,
             crc: crc,
             flush_offset: 0,
-        })
+        };
+        info!("{:?}: opened", segment);
+        Ok(segment)
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -244,11 +255,9 @@ impl Segment {
     /// to be durably stored on disk until the segment is successfully flushed.
     pub fn append<T>(&mut self, entry: &T) -> Option<usize> where T: ops::Deref<Target=[u8]> {
         if !self.sufficient_capacity(entry.len()) {
-            debug!("{:?}: insufficient remaining capacity to append {} byte entry",
-                   self, entry.len());
             return None;
         }
-        info!("{:?}: appending {} byte entry", self, entry.len());
+        trace!("{:?}: appending {} byte entry", self, entry.len());
 
         let padding = padding(entry.len());
         let padded_len = entry.len() + padding;
@@ -282,6 +291,7 @@ impl Segment {
     /// successfully flushed.
     pub fn truncate(&mut self, from: usize) {
         if from >= self.index.len() { return; }
+        trace!("{:?}: truncating from position {}", self, from);
 
         // Remove the index entries.
         let _ = self.index.drain(from..);
@@ -301,7 +311,9 @@ impl Segment {
         if start == end {
             Ok(())
         } else {
+            debug!("{:?}: flushing byte range [{}, {})", self, start, end);
             let mut view = unsafe { self.mmap.clone() };
+            self.set_flush_offset(end);
             try!(view.restrict(start, end - start));
             view.flush()
         }
@@ -319,7 +331,13 @@ impl Segment {
             let mut view = unsafe { self.mmap.clone() };
             self.set_flush_offset(end);
             let (complete, future) = Future::pair();
+
+            let log_msg = if log_enabled!(log::LogLevel::Debug) {
+                format!("{:?}: async flushing byte range [{}, {})", &self, start, end)
+            } else { String::new() };
+
             thread::spawn(move || {
+                debug!("{}", log_msg);
                 match view.restrict(start, end - start).and_then(|_| view.flush()) {
                     Ok(_) => complete.complete(()),
                     Err(error) => complete.fail(error),
@@ -335,8 +353,7 @@ impl Segment {
         // Sanity check the 8-byte alignment invariant.
         assert_eq!(required_capacity & !7, required_capacity);
         if required_capacity > self.capacity() {
-            info!("{:?}: extending capacity to {} for entry of size {}",
-                  self, required_capacity, entry_size);
+            info!("{:?}: resizing to {} bytes", self, required_capacity);
             try!(self.flush());
             let file = try!(OpenOptions::new()
                                         .read(true)
@@ -395,6 +412,7 @@ impl Segment {
     /// The caller is responsible for syncing the directory in order to
     /// guarantee that the rename is durable in the event of a crash.
     pub fn rename<P>(&mut self, path: P) -> Result<()> where P: AsRef<Path> {
+        info!("{:?}: renaming file to {:?}", self, path.as_ref());
         try!(fs::rename(&self.path, &path));
         self.path = path.as_ref().to_path_buf();
         Ok(())
@@ -402,6 +420,7 @@ impl Segment {
 
     /// Deletes the segment file.
     pub fn delete(self) -> Result<()> {
+        info!("{:?}: deleting file", self);
         fs::remove_file(&self.path)
     }
 }
