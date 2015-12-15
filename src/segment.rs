@@ -100,6 +100,8 @@ impl fmt::Debug for Entry {
 /// Segment modifications are logged. Metadata operations (create, open, resize,
 /// file rename) are logged at `info` level, flush events are logged at `debug`
 /// level, and entry events (append and truncate) are logged at `trace` level.
+/// Long-running or multi-step operations will log a message at a lower level
+/// when beginning, and a final completion message.
 pub struct Segment {
     /// The segment file buffer.
     mmap: MmapViewSync,

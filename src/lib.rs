@@ -72,26 +72,44 @@ enum WalSegment {
     Closed(ClosedSegment),
 }
 
+/// A write ahead log.
+///
+/// ### Logging
+///
+/// Wal operations are logged. Metadata operations (open) are logged at `info`
+/// level. Segment operations (create, close, delete) are logged at `debug`
+/// level. Flush operations are logged at `debug` level. Entry operations
+/// (append, truncate) are logged at `trace` level. Long-running or multi-step
+/// operations will log a message at a lower level when beginning, and a final
+/// completion message.
 pub struct Wal {
     /// The segment currently being appended to.
     open_segment: OpenSegment,
     closed_segments: Vec<ClosedSegment>,
     creator: SegmentCreator,
-    /// The directory containing the write ahead log. Used to hold an open file
-    /// lock for the lifetime of the log.
+
+    /// The directory which contains the write ahead log. Used to hold an open
+    /// file lock for the lifetime of the log.
     #[allow(dead_code)]
     dir: File,
 
-    /// Keeps track of the flush completions of previously closed segments.
+    /// The directory path.
+    path: PathBuf,
+
+    /// Tracks the flush status of recently closed segments between user calls
+    /// to `Wal::flush`.
     flush: Option<Future<(), Error>>,
 }
 
 impl Wal {
+
     pub fn open<P>(path: P) -> Result<Wal> where P: AsRef<Path> {
         Wal::with_options(path, &WalOptions::default())
     }
 
     pub fn with_options<P>(path: P, options: &WalOptions) -> Result<Wal> where P: AsRef<Path> {
+        debug!("Wal {{ path: {:?} }}: opening", path.as_ref());
+
         let dir = try!(File::open(&path));
         try!(dir.try_lock_exclusive());
 
@@ -161,17 +179,20 @@ impl Wal {
             None => try!(creator.next()),
         };
 
-        Ok(Wal {
+        let wal = Wal {
             open_segment: open_segment,
             closed_segments: closed_segments,
             creator: creator,
             dir: dir,
+            path: path.as_ref().to_path_buf(),
             flush: None,
-        })
+        };
+        info!("{:?}: opened", wal);
+        Ok(wal)
     }
 
     fn retire_open_segment(&mut self) -> Result<()> {
-        // TODO: time the next call
+        trace!("{:?}: retiring open segment", self);
         let mut segment = try!(self.creator.next());
         mem::swap(&mut self.open_segment, &mut segment);
 
@@ -182,10 +203,12 @@ impl Wal {
 
         let start_index = self.open_segment_start_index();
         self.closed_segments.push(try!(close_segment(segment, start_index)));
+        debug!("{:?}: open segment retired", self);
         Ok(())
     }
 
     pub fn append<T>(&mut self, entry: &T) -> Result<u64> where T: ops::Deref<Target=[u8]> {
+        trace!("{:?}: appending entry of length {}", self, entry.len());
         if !self.open_segment.segment.sufficient_capacity(entry.len()) {
             if self.open_segment.segment.len() > 0 {
                 try!(self.retire_open_segment());
@@ -284,14 +307,15 @@ impl Wal {
 
 impl fmt::Debug for Wal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Wal {{ segment_count: {} }}",
-               self.closed_segments.len() + 1)
+        let start_index = self.closed_segments.get(0).map(|segment| segment.start_index).unwrap_or(0);
+        let end_index = self.open_segment_start_index() + self.open_segment.segment.len() as u64;
+        write!(f, "Wal {{ path: {:?}, segment-count: {}, entries: [{}, {})  }}",
+               &self.path, self.closed_segments.len() + 1, start_index, end_index)
     }
 }
 
 fn close_segment(mut segment: OpenSegment, start_index: u64) -> Result<ClosedSegment> {
     let new_path = segment.segment.path().with_file_name(format!("closed-{}", start_index));
-    debug!("closing {:?}, start index: {:?}", segment.segment, start_index);
     try!(segment.segment.rename(new_path));
     Ok(ClosedSegment { start_index: start_index, segment: segment.segment })
 }
@@ -395,10 +419,10 @@ fn create_loop(tx: SyncSender<OpenSegment>,
     let dir = try!(File::open(&path));
 
     while cont {
+        id += 1;
         path.push(format!("open-{}", id));
         let segment = OpenSegment { id: id, segment: try!(Segment::create(&path, capacity)) };
         path.pop();
-        id += 1;
         // Sync the directory, guaranteeing that the segment file is durably
         // stored on the filesystem.
         try!(dir.sync_all());
@@ -420,7 +444,13 @@ mod test {
     use quickcheck::TestResult;
     use tempdir;
 
-    use super::{SegmentCreator, Wal, WalOptions};
+    use super::{
+        OpenSegment,
+        SegmentCreator,
+        Wal,
+        WalOptions,
+    };
+    use segment::Segment;
     use test_utils::EntryGenerator;
 
     /// Check that entries appended to the write ahead log can be read back.
@@ -448,8 +478,7 @@ mod test {
             TestResult::passed()
         }
 
-        wal(50);
-        //quickcheck::quickcheck(wal as fn(usize) -> TestResult);
+        quickcheck::quickcheck(wal as fn(usize) -> TestResult);
     }
 
     /// Check that the Wal will read previously written entries.
@@ -577,10 +606,14 @@ mod test {
     fn test_segment_creator() {
         let _ = env_logger::init();
         let dir = tempdir::TempDir::new("segment").unwrap();
-        let mut creator = SegmentCreator::new(&dir.path(), vec![], 1, 1024);
 
-        for _ in 0..10 {
-            let _ = creator.next();
+        let segments = vec![
+            OpenSegment { id: 3, segment: Segment::create(&dir.path().join("open-3"), 1024).unwrap() },
+        ];
+
+        let mut creator = SegmentCreator::new(&dir.path(), segments, 1024, 1);
+        for i in 3..10 {
+            assert_eq!(i, creator.next().unwrap().id);
         }
     }
 }
