@@ -303,6 +303,20 @@ impl Wal {
         });
         result
     }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn num_segments(&self) -> usize {
+        self.closed_segments.len() + 1
+    }
+
+    pub fn num_entries(&self) -> u64 {
+        self.open_segment_start_index()
+            - self.closed_segments.get(0).map(|segment| segment.start_index).unwrap_or(0)
+            + self.open_segment.segment.len() as u64
+    }
 }
 
 impl fmt::Debug for Wal {
