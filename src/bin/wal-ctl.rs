@@ -6,7 +6,6 @@ extern crate wal;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::error::Error;
 
 use docopt::Docopt;
 use wal::Wal;
@@ -51,14 +50,14 @@ fn main() {
                             .unwrap_or_else(|e| e.exit());
 
     let path: PathBuf = PathBuf::from(&args.flag_path).canonicalize().unwrap_or_else(|error| {
-        write!(io::stderr(), "Unable to open write ahead log in directory {:?}: {}.\n",
-               &args.flag_path, error);
+        writeln!(io::stderr(), "Unable to open write ahead log in directory {:?}: {}.",
+                 &args.flag_path, error).unwrap();
         process::exit(1);
     });
 
     if !path.is_dir() {
-        write!(io::stderr(), "Unable to open write ahead log: path {:?} is not a directory.\n",
-               path);
+        writeln!(io::stderr(), "Unable to open write ahead log: path {:?} is not a directory.",
+                 path).unwrap();
         process::exit(1);
     }
 
@@ -78,7 +77,8 @@ fn main() {
 
 fn open_wal(path: &Path) -> Wal {
     Wal::open(path).unwrap_or_else(|error| {
-        write!(io::stderr(), "Unable to open write ahead log in directory {:?}: {}.\n", path, error);
+        writeln!(io::stderr(), "Unable to open write ahead log in directory {:?}: {}.",
+                 path, error).unwrap();
         process::exit(1);
     })
 }
@@ -91,11 +91,11 @@ fn check(wal: Wal) {
 fn entry(wal: Wal, index: u64) {
     match wal.entry(index) {
         Some(entry) => {
-            io::stdout().write_all(&*entry);
+            io::stdout().write_all(&*entry).unwrap();
         },
         None => {
-            write!(io::stderr(), "No entry at index {} in the write ahead log in directory {:?}.\n",
-                   index, &wal.path());
+            writeln!(io::stderr(), "No entry at index {} in the write ahead log in directory {:?}.",
+                     index, &wal.path()).unwrap();
             process::exit(1);
         }
     }

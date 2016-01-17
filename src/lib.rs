@@ -126,7 +126,7 @@ impl Wal {
 
         // Validate the closed segments. They must be non-overlapping, and contiguous.
         closed_segments.sort_by(|a, b| a.start_index.cmp(&b.start_index));
-        let mut next_start_index = 0;
+        let mut next_start_index = closed_segments.get(0).map_or(0, |segment| segment.start_index);
         for &ClosedSegment { start_index, ref segment, .. } in &closed_segments {
             if start_index > next_start_index {
                 return Err(Error::new(ErrorKind::InvalidData,
@@ -149,7 +149,7 @@ impl Wal {
         let mut unused_segments: Vec<OpenSegment> = Vec::new();
 
         for segment in open_segments {
-            if segment.segment.len() > 0 {
+            if !segment.segment.is_empty() {
                 // This segment has already been written to. If a previous open
                 // segment has also already been written to, we close it out and
                 // replace it with this new one. This may happen because when a
@@ -198,7 +198,7 @@ impl Wal {
 
         self.flush = Some(self.flush
                               .take()
-                              .unwrap_or(Future::of(()))
+                              .unwrap_or_else(|| Future::of(()))
                               .and(segment.segment.flush_async()));
 
         let start_index = self.open_segment_start_index();
@@ -210,7 +210,7 @@ impl Wal {
     pub fn append<T>(&mut self, entry: &T) -> Result<u64> where T: ops::Deref<Target=[u8]> {
         trace!("{:?}: appending entry of length {}", self, entry.len());
         if !self.open_segment.segment.sufficient_capacity(entry.len()) {
-            if self.open_segment.segment.len() > 0 {
+            if !self.open_segment.segment.is_empty() {
                 try!(self.retire_open_segment());
             }
             try!(self.open_segment.segment.ensure_capacity(entry.len()));
@@ -276,8 +276,7 @@ impl Wal {
                 Err(index) => {
                     // The truncate index is before the first entry of the wal
                     assert!(from <= self.closed_segments.get(index)
-                                                        .map(|segment| segment.start_index)
-                                                        .unwrap_or(0));
+                                                        .map_or(0, |segment| segment.start_index));
                     for segment in self.closed_segments.drain(..) {
                         // TODO: this should be async
                         segment.segment.delete().unwrap();
@@ -291,17 +290,15 @@ impl Wal {
     fn open_segment_start_index(&self) -> u64 {
         self.closed_segments
             .last()
-            .map(|segment| segment.start_index + segment.segment.len() as u64)
-            .unwrap_or(0)
+            .map_or(0, |segment| segment.start_index + segment.segment.len() as u64)
     }
 
     fn find_closed_segment(&self, index: u64) -> result::Result<usize, usize> {
-        let result = self.closed_segments.binary_search_by(|segment| {
+        self.closed_segments.binary_search_by(|segment| {
             if index < segment.start_index { Ordering::Greater }
             else if index >= segment.start_index + segment.segment.len() as u64 { Ordering::Less }
             else { Ordering::Equal }
-        });
-        result
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -314,14 +311,14 @@ impl Wal {
 
     pub fn num_entries(&self) -> u64 {
         self.open_segment_start_index()
-            - self.closed_segments.get(0).map(|segment| segment.start_index).unwrap_or(0)
+            - self.closed_segments.get(0).map_or(0, |segment| segment.start_index)
             + self.open_segment.segment.len() as u64
     }
 }
 
 impl fmt::Debug for Wal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let start_index = self.closed_segments.get(0).map(|segment| segment.start_index).unwrap_or(0);
+        let start_index = self.closed_segments.get(0).map_or(0, |segment| segment.start_index);
         let end_index = self.open_segment_start_index() + self.open_segment.segment.len() as u64;
         write!(f, "Wal {{ path: {:?}, segment-count: {}, entries: [{}, {})  }}",
                &self.path, self.closed_segments.len() + 1, start_index, end_index)

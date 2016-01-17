@@ -16,12 +16,14 @@ use std::thread;
 use byteorder::{ByteOrder, LittleEndian};
 use crc::crc32;
 use eventual::{Async, Future};
+use fs2::FileExt;
 use log;
 use memmap::{Mmap, Protection, MmapViewSync};
 use rand;
 
 /// The magic bytes and version tag of the segment header.
-const SEGMENT_HEADER: &'static [u8; 4] = b"wal\0";
+const SEGMENT_MAGIC: &'static [u8; 3] = b"wal";
+const SEGMENT_VERSION: u8 = 0;
 
 /// The length of both the segment and entry header.
 const HEADER_LEN: usize = 8;
@@ -48,7 +50,7 @@ impl fmt::Debug for Entry {
     }
 }
 
-/// An append-only, fixed-length, durable, on-disk container of entries.
+/// An append-only, fixed-length, durable container of entries.
 ///
 /// The segment on-disk format is as simple as possible, while providing
 /// backwards compatibility, protection against corruption, and alignment
@@ -76,9 +78,8 @@ impl fmt::Debug for Entry {
 ///
 /// The segment header is 8 bytes long: three magic bytes ("wal") followed by a
 /// segment format version `u8`, followed by a random `u32` CRC seed. The CRC
-/// seed is serialized in little-endian format. The CRC seed ensures that if a
-/// segment file is reused for a new segment, the old entries will be ignored
-/// (since the CRC will not match).
+/// seed ensures that if a segment file is reused for a new segment, the old
+/// entries will be ignored (since the CRC will not match).
 ///
 /// ### Entry Format
 ///
@@ -91,17 +92,18 @@ impl fmt::Debug for Entry {
 ///
 /// Entries are serialized to the log with a fixed-length header, followed by
 /// the data itself, and finally a variable length footer. The header includes
-/// the length of the data as a u64 in little-endian format. The footer includes
-/// between 0 and 7 bytes of padding to extend the total length of the entry to
-/// a multiple of 8, followed by the CRC code of the length, data, and padding.
+/// the length of the entry as a u64. The footer includes between 0 and 7 bytes
+/// of padding to extend the total length of the entry to a multiple of 8,
+/// followed by the CRC code of the length, data, and padding.
 ///
 /// ### Logging
 ///
-/// Segment modifications are logged. Metadata operations (create, open, resize,
-/// file rename) are logged at `info` level, flush events are logged at `debug`
-/// level, and entry events (append and truncate) are logged at `trace` level.
-/// Long-running or multi-step operations will log a message at a lower level
-/// when beginning, and a final completion message.
+/// Segment modifications are logged through the standard Rust [logging
+/// facade](https://crates.io/crates/log/). Metadata operations (create, open,
+/// resize, file rename) are logged at `info` level, flush events are logged at
+/// `debug` level, and entry events (append and truncate) are logged at `trace`
+/// level. Long-running or multi-step operations will log a message at a lower
+/// level when beginning, with a final completion message at a higher level.
 pub struct Segment {
     /// The segment file buffer.
     mmap: MmapViewSync,
@@ -117,15 +119,12 @@ pub struct Segment {
 
 impl Segment {
 
-    /// Creates a new segment file at the specified path with the provided
-    /// initial capacity.
+    /// Creates a new segment.
     ///
     /// The initial capacity must be at least 8 bytes.
     ///
     /// If a file already exists at the path it will be overwritten, and the
     /// allocated space will be reused.
-    ///
-    /// An individual file should only be opened by a single segment at a time.
     ///
     /// The caller is responsible for flushing the containing directory in order
     /// to guarantee that the segment is durable in the event of a crash.
@@ -134,11 +133,12 @@ impl Segment {
         // segment would not be able to take advantage of the space.
         let capacity = capacity & !7;
         if capacity < HEADER_LEN {
-            return Err(Error::new(ErrorKind::InvalidInput, "invalid segment capacity"));
+            return Err(Error::new(ErrorKind::InvalidInput,
+                                  format!("invalid segment capacity: {}", capacity)));
         }
 
         let file = try!(OpenOptions::new().read(true).write(true).create(true).open(&path));
-        try!(file.set_len(capacity as u64));
+        try!(file.allocate(capacity as u64));
 
         let mut mmap = try!(Mmap::open_with_offset(&file,
                                                    Protection::ReadWrite,
@@ -146,9 +146,12 @@ impl Segment {
                                                    capacity)).into_view_sync();
         let seed = rand::random();
 
-        // Write and flush the header information.
-        copy_memory(SEGMENT_HEADER, unsafe { &mut mmap.as_mut_slice()[..4] });
-        LittleEndian::write_u32(unsafe { &mut mmap.as_mut_slice()[4..] }, seed);
+        {
+            let mut segment = unsafe { &mut mmap.as_mut_slice() };
+            copy_memory(SEGMENT_MAGIC, segment);
+            segment[3] = SEGMENT_VERSION;
+            LittleEndian::write_u32(&mut segment[4..], seed);
+        }
 
         let segment = Segment {
             mmap: mmap,
@@ -163,12 +166,13 @@ impl Segment {
 
     /// Opens the segment file at the specified path.
     ///
-    /// An individual file should only be opened by one segment at a time.
+    /// An individual file must only be opened by one segment at a time.
     pub fn open<P>(path: P) -> Result<Segment> where P: AsRef<Path> {
         let file = try!(OpenOptions::new().read(true).write(true).create(false).open(&path));
         let capacity = try!(file.metadata()).len();
-        if capacity > usize::max_value() as u64 {
-            return Err(Error::new(ErrorKind::InvalidInput, "invalid segment capacity"));
+        if capacity > usize::max_value() as u64 || capacity < HEADER_LEN as u64 {
+            return Err(Error::new(ErrorKind::InvalidInput,
+                                  format!("invalid segment capacity: {}", capacity)));
         }
 
         // Round capacity down to the nearest 8-byte alignment, since the
@@ -188,19 +192,31 @@ impl Segment {
             // If the CRC of any entry does not match, then parsing stops and
             // the remainder of the file is considered empty.
             let segment = unsafe { mmap.as_slice() };
-            crc = LittleEndian::read_u32(&segment[SEGMENT_HEADER.len()..]);
+
+            if &segment[0..3] != b"wal" {
+                return Err(Error::new(ErrorKind::InvalidData, "Illegal segment header"));
+            }
+
+            if segment[3] != 0 {
+                return Err(Error::new(ErrorKind::InvalidData,
+                                      format!("Segment version unsupported: {}", segment[3])));
+            }
+
+            crc = LittleEndian::read_u32(&segment[4..]);
             let mut offset = HEADER_LEN;
 
-            while segment.len() >= offset + HEADER_LEN + CRC_LEN {
+            while offset + HEADER_LEN + CRC_LEN < capacity {
                 let len = LittleEndian::read_u64(&segment[offset..]) as usize;
                 let padding = padding(len);
                 let padded_len = len + padding;
-                if offset + HEADER_LEN + padded_len + CRC_LEN > segment.len() { break; }
+                if offset + HEADER_LEN + padded_len + CRC_LEN > capacity { break; }
 
                 let entry_crc = crc32::update(crc,
                                               &crc32::CASTAGNOLI_TABLE,
                                               &segment[offset..offset + HEADER_LEN + padded_len]);
-                if entry_crc != LittleEndian::read_u32(&segment[offset + HEADER_LEN + padded_len..]) { break; }
+                if entry_crc != LittleEndian::read_u32(&segment[offset + HEADER_LEN + padded_len..]) {
+                    break;
+                }
 
                 crc = entry_crc;
                 index.push((offset + HEADER_LEN, len));
@@ -245,7 +261,7 @@ impl Segment {
                 // restrict only fails on bounds errors, but an invariant of
                 // Segment is that the index always holds valid offset and
                 // length bounds.
-                view.restrict(offset, len).unwrap();
+                view.restrict(offset, len).expect("illegal segment offset or length");
                 Entry { view: view }
             })
     }
@@ -254,7 +270,7 @@ impl Segment {
     /// or `None` if there is insufficient space for the entry.
     ///
     /// The entry may be immediately read from the log, but it is not guaranteed
-    /// to be durably stored on disk until the segment is successfully flushed.
+    /// to be durably stored on disk until the segment is flushed.
     pub fn append<T>(&mut self, entry: &T) -> Option<usize> where T: ops::Deref<Target=[u8]> {
         if !self.sufficient_capacity(entry.len()) {
             return None;
@@ -290,7 +306,7 @@ impl Segment {
     /// Truncates the entries in the segment beginning with `from`.
     ///
     /// The entries are not guaranteed to be removed until the segment is
-    /// successfully flushed.
+    /// flushed.
     pub fn truncate(&mut self, from: usize) {
         if from >= self.index.len() { return; }
         trace!("{:?}: truncating from position {}", self, from);
@@ -349,6 +365,10 @@ impl Segment {
         }
     }
 
+    /// Ensure that the segment can store an entry of the provided size.
+    ///
+    /// If the current segment length is insufficient then it is resized. This
+    /// is potentially a very slow operation.
     pub fn ensure_capacity(&mut self, entry_size: usize) -> Result<()> {
         let required_capacity =
             entry_size + padding(entry_size) + HEADER_LEN + CRC_LEN + self.size();
@@ -362,7 +382,7 @@ impl Segment {
                                         .write(true)
                                         .create(false)
                                         .open(&self.path));
-            try!(file.set_len(required_capacity as u64));
+            try!(file.allocate(required_capacity as u64));
 
             let mut mmap = try!(Mmap::open_with_offset(&file,
                                                        Protection::ReadWrite,
@@ -378,6 +398,11 @@ impl Segment {
         self.index.len()
     }
 
+    /// Returns true if the segment has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
     /// Returns the capacity (file-size) of the segment in bytes
     ///
     /// Each entry is stored with a header and padding, so the entire capacity
@@ -391,16 +416,14 @@ impl Segment {
     pub fn size(&self) -> usize {
         self.index
             .last()
-            .map(|&(offset, len)| offset + len + padding(len) + CRC_LEN )
-            .unwrap_or(HEADER_LEN)
+            .map_or(HEADER_LEN, |&(offset, len)| offset + len + padding(len) + CRC_LEN)
     }
 
     /// Returns `true` if the segment has sufficient remaining capacity to
     /// append an entry of size `entry_len`.
     pub fn sufficient_capacity(&self, entry_len: usize) -> bool {
         (self.capacity() - self.size()).checked_sub(HEADER_LEN + CRC_LEN)
-                                       .map(|rem| rem >= entry_len + padding(entry_len))
-                                       .unwrap_or(false)
+                                       .map_or(false, |rem| rem >= entry_len + padding(entry_len))
     }
 
 
@@ -598,8 +621,8 @@ mod test {
         assert_eq!(4096, segment.capacity());
         assert_eq!(entries.len(), segment.len());
 
-        for index in 0..entries.len() {
-            assert_eq!(entries[index], &*segment.entry(index).unwrap());
+        for (index, &entry) in entries.iter().enumerate() {
+            assert_eq!(entry, &*segment.entry(index).unwrap());
         }
     }
 

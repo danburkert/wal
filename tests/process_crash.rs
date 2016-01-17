@@ -20,8 +20,6 @@ use std::process;
 use std::collections::HashMap;
 
 use rand::Rng;
-
-use wal::Segment;
 use wal::test_utils::EntryGenerator;
 
 const SEGMENT_CAPACITY: usize = 32 * 1024 * 1024;

@@ -35,7 +35,7 @@ impl EntryGenerator {
     pub fn with_segment_capacity(size: usize) -> EntryGenerator {
         let seed: usize = env::var("WAL_TEST_SEED")
                               .map(|seed| seed.parse::<usize>().unwrap())
-                              .unwrap_or(rand::random());
+                              .unwrap_or_else(|_| rand::random());
         EntryGenerator::with_seed_and_segment_capacity(seed, size)
     }
 
