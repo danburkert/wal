@@ -137,7 +137,7 @@ impl Wal {
                 // Current thinking is the previous segment should be truncated.
                 unimplemented!()
             }
-            next_start_index += segment.len() as u64;
+            next_start_index = start_index + segment.len() as u64;
         }
 
         // Validate the open segments.
@@ -203,7 +203,7 @@ impl Wal {
 
         let start_index = self.open_segment_start_index();
         self.closed_segments.push(try!(close_segment(segment, start_index)));
-        debug!("{:?}: open segment retired", self);
+        debug!("{:?}: open segment retired. start_index: {}", self, start_index);
         Ok(())
     }
 
@@ -245,7 +245,8 @@ impl Wal {
     /// Entries can be immediately appended to the log once this method returns,
     /// but the truncated entries are not guaranteed to be removed until the
     /// wal is flushed.
-    pub fn truncate(&mut self, from: u64) {
+    pub fn truncate(&mut self, from: u64) -> Result<()> {
+        trace!("{:?}: truncate from entry {}", self, from);
         let open_start_index = self.open_segment_start_index();
         if from >= open_start_index {
             self.open_segment.segment.truncate((from - open_start_index) as usize);
@@ -258,7 +259,7 @@ impl Wal {
                     if from == self.closed_segments[index].start_index {
                         for segment in self.closed_segments.drain(index..) {
                             // TODO: this should be async
-                            segment.segment.delete().unwrap();
+                            try!(segment.segment.delete());
                         }
                     } else {
                         {
@@ -268,7 +269,7 @@ impl Wal {
                         if index + 1 < self.closed_segments.len() {
                             for segment in self.closed_segments.drain(index + 1..) {
                                 // TODO: this should be async
-                                segment.segment.delete().unwrap();
+                                try!(segment.segment.delete());
                             }
                         }
                     }
@@ -279,11 +280,35 @@ impl Wal {
                                                         .map_or(0, |segment| segment.start_index));
                     for segment in self.closed_segments.drain(..) {
                         // TODO: this should be async
-                        segment.segment.delete().unwrap();
+                        try!(segment.segment.delete());
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Possibly removes entries from the beginning of the log before the given index.
+    ///
+    /// After calling this method, the `first_index` will be between the current
+    /// `first_index` (inclusive), and `until` (exclusive).
+    pub fn prefix_truncate(&mut self, until: u64) -> Result<()> {
+        trace!("{:?}: prefix_truncate until entry {}", self, until);
+        if until <= self.closed_segments.get(0).map_or(0, |segment| segment.start_index) {
+            // Do nothing, the first entry is already greater than `until`.
+        } else if until >= self.open_segment_start_index() {
+            // Truncate all closed segments.
+            for segment in self.closed_segments.drain(..) {
+                try!(segment.segment.delete())
+            }
+        } else {
+            let index = self.find_closed_segment(until).unwrap();
+            trace!("PREFIX TRUNCATING UNTIL SEGMENT {}", index);
+            for segment in self.closed_segments.drain(..index) {
+                try!(segment.segment.delete())
+            }
+        }
+        Ok(())
     }
 
     /// Returns the start index of the open segment.
@@ -313,6 +338,13 @@ impl Wal {
         self.open_segment_start_index()
             - self.closed_segments.get(0).map_or(0, |segment| segment.start_index)
             + self.open_segment.segment.len() as u64
+    }
+
+    /// The index of the first entry.
+    pub fn first_index(&self) -> u64 {
+        self.closed_segments
+            .get(0)
+            .map_or(0, |segment| segment.start_index)
     }
 }
 
@@ -525,7 +557,6 @@ mod test {
         quickcheck::quickcheck(wal as fn(usize) -> TestResult);
     }
 
-    /// Check that entries appended to the write ahead log can be read back.
     #[test]
     fn check_truncate() {
         let _ = env_logger::init();
@@ -543,7 +574,7 @@ mod test {
                 }
             }
 
-            wal.truncate(truncate as u64);
+            wal.truncate(truncate as u64).unwrap();
 
             for (index, expected) in entries.iter().take(truncate).enumerate() {
                 match wal.entry(index as u64) {
@@ -553,12 +584,35 @@ mod test {
                 }
             }
 
-            TestResult::from_bool(wal.entry(truncate as u64).is_none());
-
-            TestResult::passed()
+            TestResult::from_bool(wal.entry(truncate as u64).is_none())
         }
 
         quickcheck::quickcheck(truncate as fn(usize, usize) -> TestResult);
+    }
+
+    #[test]
+    fn check_prefix_truncate() {
+        let _ = env_logger::init();
+        fn prefix_truncate(entry_count: usize, until: usize) -> TestResult {
+            trace!("prefix truncate; entry_count: {}, until: {}", entry_count, until);
+            if until > entry_count { return TestResult::discard(); }
+            let dir = tempdir::TempDir::new("wal").unwrap();
+            let mut wal = Wal::with_options(&dir.path(),
+                                            &WalOptions { segment_capacity: 80,
+                                                          segment_queue_len: 3 }).unwrap();
+            let entries = EntryGenerator::new().into_iter().take(entry_count).collect::<Vec<_>>();
+
+            for entry in &entries {
+                wal.append(entry).unwrap();
+            }
+
+            wal.prefix_truncate(until as u64).unwrap();
+
+            let num_entries = wal.num_entries() as usize;
+            TestResult::from_bool(num_entries <= entry_count &&
+                                  num_entries >= entry_count - until)
+        }
+        quickcheck::quickcheck(prefix_truncate as fn(usize, usize) -> TestResult);
     }
 
     #[test]
@@ -590,14 +644,14 @@ mod test {
                 assert_eq!(i, wal.append(&&entry[..]).unwrap());
             }
 
-            wal.truncate(truncate_index);
+            wal.truncate(truncate_index).unwrap();
 
             assert!(wal.entry(truncate_index).is_none());
 
             if truncate_index > 0 {
                 assert!(wal.entry(truncate_index - 1).is_some());
             }
-            wal.truncate(0);
+            wal.truncate(0).unwrap();
         }
     }
 
