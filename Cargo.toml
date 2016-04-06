@@ -4,13 +4,14 @@ version = "0.1.0"
 authors = ["Dan Burkert <dan@danburkert.com>"]
 
 [dependencies]
-byteorder = "0.4"
+byteorder = "0.5"
 crc = "1"
 eventual = "0.1.4"
 fs2 = "0.2"
 log = "0.3"
-memmap = "0.2"
+memmap = "0.3"
 rand = "0.3"
+syncbox = "0.2"
 time = "0.1"
 
 # Binary dependencies

@@ -20,6 +20,7 @@ use fs2::FileExt;
 use log;
 use memmap::{Mmap, Protection, MmapViewSync};
 use rand;
+use syncbox::{Task, ThreadPool};
 
 /// The magic bytes and version tag of the segment header.
 const SEGMENT_MAGIC: &'static [u8; 3] = b"wal";
@@ -111,6 +112,8 @@ pub struct Segment {
     path: PathBuf,
     /// Index of entry offset and lengths.
     index: Vec<(usize, usize)>,
+
+    pool: ThreadPool<FlushSegmentTask>,
     /// The crc of the last appended entry.
     crc: Crc,
     /// Offset of last flush.
@@ -157,6 +160,7 @@ impl Segment {
             mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: Vec::new(),
+            pool: ThreadPool::single_thread(),
             crc: seed,
             flush_offset: 0,
         };
@@ -228,6 +232,7 @@ impl Segment {
             mmap: mmap,
             path: path.as_ref().to_path_buf(),
             index: index,
+            pool: ThreadPool::single_thread(),
             crc: crc,
             flush_offset: 0,
         };
@@ -314,6 +319,8 @@ impl Segment {
         // Remove the index entries.
         let _ = self.index.drain(from..);
 
+        // TODO: the CRC is probably out of sync at this point
+
         // And overwrite the existing data so that we will not read the data back after a crash.
         let size = self.size();
         let zeroes: [u8; 16] = [0; 16];
@@ -347,20 +354,12 @@ impl Segment {
             Future::of(())
         } else {
             let mut view = unsafe { self.mmap.clone() };
+            view.restrict(start, end - start).expect("illegal segment offset or length");
             self.set_flush_offset(end);
             let (complete, future) = Future::pair();
 
-            let log_msg = if log_enabled!(log::LogLevel::Debug) {
-                format!("{:?}: async flushing byte range [{}, {})", &self, start, end)
-            } else { String::new() };
-
-            thread::spawn(move || {
-                debug!("{}", log_msg);
-                match view.restrict(start, end - start).and_then(|_| view.flush()) {
-                    Ok(_) => complete.complete(()),
-                    Err(error) => complete.fail(error),
-                }
-            });
+            pool.run(FlushSegmentTask { mmap: view.restrict(start, end - start),
+                                        complete: complete });
             future
         }
     }
@@ -483,6 +482,20 @@ pub fn entry_overhead(len: usize) -> usize {
 /// Returns the fixed-overhead of segment metadata.
 pub fn segment_overhead() -> usize {
     HEADER_LEN
+}
+
+#[derive(Debug)]
+pub struct FlushSegmentTask {
+    mmap: MmapViewSync,
+    complete: Complete<(), Error>,
+}
+
+impl Task for FlushSegmentTask {
+    fn run(self) {
+        debug!("async flushing byte range [{}, {})",
+               self.mmap.offset(), self.mmap.offset() + self.mmap.len());
+        self.complete.complete(self.mmap.flush());
+    }
 }
 
 #[cfg(test)]

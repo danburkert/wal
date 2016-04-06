@@ -6,6 +6,7 @@ extern crate eventual;
 extern crate fs2;
 extern crate memmap;
 extern crate rand;
+extern crate syncbox;
 extern crate time;
 
 #[macro_use] extern crate log;
