@@ -377,12 +377,12 @@ fn open_dir_entry(entry: fs::DirEntry) -> Result<WalSegment> {
 
     let filename = try!(entry.file_name().into_string().map_err(|_| error()));
     match &*filename.split('-').collect::<Vec<&str>>() {
-        ["open", id] => {
+        &["open", ref id] => {
             let id = try!(u64::from_str(id).map_err(|_| error()));
             let segment = try!(Segment::open(entry.path()));
             Ok(WalSegment::Open(OpenSegment { segment: segment, id: id }))
         },
-        ["closed", start] => {
+        &["closed", ref start] => {
             let start = try!(u64::from_str(start).map_err(|_| error()));
             let segment = try!(Segment::open(entry.path()));
             Ok(WalSegment::Closed(ClosedSegment { start_index: start, segment: segment }))
